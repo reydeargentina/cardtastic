@@ -48,6 +48,9 @@ Navigation (Cardputer keyboard):
 - Chat: type to compose, Enter to send.
 - Chat scroll: hold FN and use `;` (up) / `.` (down). Hold Shift for page scroll.
 
+## BLE Passkey (v0.1)
+Cardtastic v0.1 injects a fixed BLE passkey: `123456`. Your Meshtastic node must use that PIN to pair. Other PINs will fail to authenticate.
+
 ## Persistence (SD)
 If a microSD card is present, Cardtastic stores conversations as JSON under `/cardtastic/` on the card. The app keeps the most recent 50 messages per conversation. If no card is available, conversations live in RAM only.
 
