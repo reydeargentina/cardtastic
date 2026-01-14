@@ -2,6 +2,7 @@
 #include <SPI.h>
 #include <ArduinoJson.h>
 #include <algorithm>
+#include <cmath>
 #include <stdlib.h>
 #include "M5Cardputer.h"
 #include <vector>
@@ -51,6 +52,67 @@ void drawFooterBackground() {
     int h = d.height();
     d.fillRect(0, h - kFooterH, d.width(), kFooterH, kColorFooterBg);
     d.drawFastHLine(0, h - kFooterH, d.width(), kColorSeparator);
+}
+
+void drawCardtasticLogo(int centerX, int topY, int maxW, int maxH, uint16_t color) {
+    const float baseW = 56.0f;
+    const float baseH = 40.0f;
+    if (maxW <= 0 || maxH <= 0) return;
+
+    float scale = std::min(maxW / baseW, maxH / baseH);
+    if (scale <= 0.0f) return;
+
+    int w = (int)lroundf(baseW * scale);
+    int h = (int)lroundf(baseH * scale);
+    if (w < 12 || h < 8) return;
+
+    int x = centerX - (w / 2);
+    int y = topY + (maxH - h) / 2;
+
+    int rx = std::max(2, (int)lroundf(6.0f * scale));
+    int nodeR = std::max(2, (int)lroundf(3.0f * scale));
+
+    auto& d = M5Cardputer.Display;
+    d.drawRoundRect(x, y, w, h, rx, color);
+    if (w > 12 && h > 12 && rx > 2) {
+        d.drawRoundRect(x + 1, y + 1, w - 2, h - 2, std::max(1, rx - 1), color);
+    }
+
+    auto sx = [&](float px) { return x + (int)lroundf(px * scale); };
+    auto sy = [&](float py) { return y + (int)lroundf(py * scale); };
+
+    int leftX   = sx(16.0f);
+    int rightX  = sx(40.0f);
+    int topYc   = sy(14.0f);
+    int bottomX = sx(28.0f);
+    int bottomY = sy(26.0f);
+
+    d.drawLine(leftX, topYc, rightX, topYc, color);
+    d.drawLine(leftX, topYc, bottomX, bottomY, color);
+    d.drawLine(rightX, topYc, bottomX, bottomY, color);
+    d.fillCircle(leftX, topYc, nodeR, color);
+    d.fillCircle(rightX, topYc, nodeR, color);
+    d.fillCircle(bottomX, bottomY, nodeR, color);
+}
+
+void drawSplashScreen() {
+    auto& d = M5Cardputer.Display;
+    d.fillScreen(kColorBodyBg);
+
+    d.setTextSize(2);
+    d.setTextColor(kColorHeaderText, kColorBodyBg);
+    String title = "CARDTASTIC";
+    int titleX = (d.width() - d.textWidth(title)) / 2;
+    if (titleX < 0) titleX = 0;
+    d.setCursor(titleX, 10);
+    d.print(title);
+
+    int logoTop = 28;
+    int logoMaxH = d.height() - logoTop - 8;
+    int logoMaxW = d.width() - 16;
+    if (logoMaxH > 0 && logoMaxW > 0) {
+        drawCardtasticLogo(d.width() / 2, logoTop, logoMaxW, logoMaxH, kColorSeparator);
+    }
 }
 
 struct Message {
@@ -495,6 +557,21 @@ const char* connectionStatusLabel() {
     return "UNKNOWN";
 }
 
+uint16_t connectionStatusColor() {
+    switch (gMesh.status()) {
+    case ConnectionStatus::CONNECTED:
+        return GREEN;
+    case ConnectionStatus::SCANNING:
+    case ConnectionStatus::CONNECTING:
+        return YELLOW;
+    case ConnectionStatus::ERROR:
+        return RED;
+    case ConnectionStatus::DISCONNECTED:
+    default:
+        return DARKGREY;
+    }
+}
+
 bool hasUnreadConversations() {
     if (gMesh.myNodeNum() == 0) return false;
     for (const auto& conv : gConversations) {
@@ -738,7 +815,12 @@ public:
         if (titleX < 0) titleX = 0;
         d.setCursor(titleX, 4);
         d.println(title);
-        d.setCursor(4, 14);
+        const int bleY = 14;
+        const int bleDotR = 3;
+        const int bleDotX = 4 + bleDotR;
+        const int bleDotY = bleY + 4;
+        d.fillCircle(bleDotX, bleDotY, bleDotR, connectionStatusColor());
+        d.setCursor(bleDotX + bleDotR + 2, bleY);
         d.print("BLE: ");
         d.println(connectionStatusLabel());
 
@@ -2057,6 +2139,8 @@ void setup() {
     M5Cardputer.begin(cfg, true);
 
     M5Cardputer.Display.setRotation(1);
+    drawSplashScreen();
+    delay(1000);
 
     gMesh.begin();     // init BLE
     gScreens.begin();
