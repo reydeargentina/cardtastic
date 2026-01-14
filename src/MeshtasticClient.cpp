@@ -35,7 +35,7 @@ class MeshClientCallbacks : public NimBLEClientCallbacks {
 MeshClientCallbacks gClientCallbacks;
 } // namespace
 
-// Instancia global
+// Global instance
 MeshtasticClient gMesh;
 
 MeshtasticClient::MeshtasticClient()
@@ -64,7 +64,7 @@ MeshtasticClient::MeshtasticClient()
 void MeshtasticClient::begin() {
     NimBLEDevice::init("Cardtastic");
 
-    // MTU recomendado por Meshtastic
+    // MTU recommended by Meshtastic
     NimBLEDevice::setMTU(512);
     NimBLEDevice::setSecurityAuth(true, true, false);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_ONLY);
@@ -110,7 +110,7 @@ void MeshtasticClient::loop() {
     }
 }
 
-// ---- Escaneo y dispositivos ----
+// ---- Scan and devices ----
 
 void MeshtasticClient::startScan() {
     _devices.clear();
@@ -122,11 +122,11 @@ void MeshtasticClient::startScan() {
 
     NimBLEScan* pScan = NimBLEDevice::getScan();
 
-    pScan->setActiveScan(true);        // pedir más info (nombre, etc.)
+    pScan->setActiveScan(true);        // request more info (name, etc.)
     pScan->setInterval(160);           // 100 ms
     pScan->setWindow(80);              //  50 ms (<= interval)
-    pScan->setDuplicateFilter(false);  // dejamos duplicados y deduplicamos por MAC
-    pScan->clearResults();             // limpiar resultados previos
+    pScan->setDuplicateFilter(false);  // keep duplicates; we dedupe by MAC
+    pScan->clearResults();             // clear previous results
 
     int totalFound = 0;
     static NimBLEUUID meshSvcUuid("6ba1b218-15a8-461f-9fa8-5dcae273eafd");
@@ -325,7 +325,7 @@ void MeshtasticClient::resetConnectionState(bool clearNodes) {
     }
 }
 
-// ---- Descubrir servicio de Meshtastic ----
+// ---- Discover Meshtastic service ----
 
 bool MeshtasticClient::discoverMeshtasticService() {
     if (!_client || !_client->isConnected()) {
@@ -365,7 +365,7 @@ bool MeshtasticClient::discoverMeshtasticService() {
 
     Serial.println("[Mesh] Mesh service + core characteristics OK");
 
-    // --- Suscripción a FromNum (packet counter) ---
+    // --- Subscribe to FromNum (packet counter) ---
     if (_charFromNum->canNotify()) {
         auto cbFromNum = [this](NimBLERemoteCharacteristic* chr,
                                 uint8_t* data,
@@ -383,7 +383,7 @@ bool MeshtasticClient::discoverMeshtasticService() {
         Serial.println("[Mesh] FromNum characteristic cannot notify");
     }
 
-    // --- Suscripción a LogRecord (opcional, solo debug) ---
+    // --- Subscribe to LogRecord (optional, debug only) ---
     if (_charLog && _charLog->canNotify()) {
         auto cbLog = [this](NimBLERemoteCharacteristic* chr,
                             uint8_t* data,
@@ -403,7 +403,7 @@ bool MeshtasticClient::discoverMeshtasticService() {
     return true;
 }
 
-// ---- Conexión por índice ----
+// ---- Connect by index ----
 
 bool MeshtasticClient::connectToIndex(int index) {
     if (index < 0 || index >= (int)_devices.size()) {
@@ -412,14 +412,14 @@ bool MeshtasticClient::connectToIndex(int index) {
         return false;
     }
 
-    // Toggle: si ya estamos conectados a ese mismo índice, desconectar
+    // Toggle: if already connected to this index, disconnect
     if (_status == ConnectionStatus::CONNECTED && _connectedIndex == index) {
         Serial.println("[Mesh] Already connected to this index, toggling -> disconnect");
         disconnect();
         return true;
     }
 
-    // Si estábamos conectados a otro, primero desconectamos
+    // If connected to another device, disconnect first
     if (_status == ConnectionStatus::CONNECTED && _connectedIndex != index) {
         Serial.println("[Mesh] Was connected to other index, disconnecting first");
         disconnect();
@@ -437,18 +437,18 @@ bool MeshtasticClient::connectToIndex(int index) {
     _radioName      = info.name;
     _connectedIndex = -1;
 
-    // Crear cliente si hace falta
+    // Create a client if needed
     if (_client == nullptr) {
         _client = NimBLEDevice::createClient();
         Serial.println("[Mesh] Created new NimBLEClient");
     }
     _client->setClientCallbacks(&gClientCallbacks, false);
 
-    // Construir la dirección a partir de la string "00:4b:12:b1:19:f6"
+    // Build address from string "00:4b:12:b1:19:f6"
     std::string addrStr(info.id.c_str());
     NimBLEAddress addr(addrStr, BLE_ADDR_PUBLIC);
 
-    // Conexión bloqueante por ahora (MVP)
+    // Blocking connect for now (MVP)
     bool ok = _client->connect(addr);
     if (!ok) {
         Serial.println("[Mesh] client->connect() returned false");
@@ -484,13 +484,13 @@ bool MeshtasticClient::connectToIndex(int index) {
     _configRequested = false;
     _configComplete = false;
 
-    // Para debug: ver todos los servicios
+    // Debug: dump all services
     debugDumpServices();
 
-    // Descubrir y suscribir al servicio MeshBluetoothService
+    // Discover and subscribe to MeshBluetoothService
     if (!discoverMeshtasticService()) {
         Serial.println("[Mesh] discoverMeshtasticService() failed after connect");
-        // discoverMeshtasticService deja el estado en ERROR si algo sale mal
+        // discoverMeshtasticService sets ERROR if something fails
         return false;
     }
 
@@ -501,7 +501,7 @@ bool MeshtasticClient::connectToIndex(int index) {
     return true;
 }
 
-// ---- Dump de servicios/characteristics ----
+// ---- Service/characteristic dump ----
 
 void MeshtasticClient::debugDumpServices() {
     if (!_client || !_client->isConnected()) {
@@ -679,7 +679,7 @@ void MeshtasticClient::setPasskey(uint32_t passkey) {
     gBlePasskey = passkey;
 }
 
-// ---- Notificaciones ----
+// ---- Notifications ----
 
 void MeshtasticClient::handleFromNumNotify(NimBLERemoteCharacteristic* chr,
                                            uint8_t* data, size_t len, bool isNotify)
@@ -715,7 +715,7 @@ void MeshtasticClient::handleLogNotify(NimBLERemoteCharacteristic* chr,
     Serial.println(line);
 }
 
-// ---- Vaciar FromRadio ----
+// ---- Drain FromRadio ----
 
 bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
 {
@@ -851,7 +851,7 @@ void MeshtasticClient::pullFromRadioUntilEmpty(bool logEmpty)
     }
 
     while (true) {
-        std::string val = _charFromRadio->readValue();  // devuelve buffer actual o vacío
+        std::string val = _charFromRadio->readValue();  // returns current buffer or empty
         if (val.empty()) {
             if (logEmpty) {
                 Serial.println("[Mesh] FromRadio empty");

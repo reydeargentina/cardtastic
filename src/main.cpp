@@ -552,10 +552,10 @@ public:
     virtual void onEnter() {}
     virtual void onExit() {}
 
-    // Navegación abstracta
+    // Abstract navigation
     virtual void handleNav(NavKey k) = 0;
 
-    // Entrada de texto opcional (por defecto ignora)
+    // Optional text input (ignored by default)
     virtual void handleChars(const std::vector<char>& chars) {
         (void)chars;
     }
@@ -714,7 +714,7 @@ public:
         d.fillScreen(BLACK);
         d.setTextColor(WHITE, BLACK);
 
-        // --- Header compacto: sólo estado en 2 líneas pequeñas ---
+        // --- Compact header: status only in two small lines ---
         d.setTextSize(1);
         d.setCursor(4, 4);
         d.print("Status: ");
@@ -749,9 +749,9 @@ public:
             d.println(count);
         }
 
-        // --- Lista: Scan + dispositivos ---
+        // --- List: Scan + devices ---
         d.setTextSize(2);
-        const int startY = 28;   // más arriba, aprovechando el espacio ganado
+        const int startY = 28;   // move up to use the freed space
         const int lineH  = 22;
         int screenH = d.height();
         int visibleRows = (screenH - 10 - startY) / lineH;
@@ -787,7 +787,7 @@ public:
             }
         }
 
-        // --- Barra inferior de ayuda ---
+        // --- Bottom help bar ---
         d.setTextSize(1);
         d.setTextColor(WHITE, BLACK);
         int h = d.height();
@@ -1317,7 +1317,7 @@ public:
         d.setTextSize(2);
         menu.drawMenu(d, items, startY, lineH, visibleRows);
 
-        // Hint debajo de la lista
+        // Hint below the list
         d.setTextSize(1);
         int hintY = startY + lineH * ((int)items.size() < visibleRows ? (int)items.size() : visibleRows) + 2;
         d.setCursor(4, hintY);
@@ -1416,9 +1416,9 @@ public:
         auto& d = M5Cardputer.Display;
         int h = d.height();
 
-        // Layout: header pequeño arriba, mensajes en el medio, input abajo
-        const int headerH = 30;   // tres líneas pequeñas
-        const int inputH  = 12;   // una línea de input
+        // Layout: small header at top, messages in the middle, input at bottom
+        const int headerH = 30;   // three small lines
+        const int inputH  = 12;   // one input line
         const int topY    = headerH + 4;
         const int bottomY = h - inputH - 2;
         const int lineH   = 10;
@@ -1455,7 +1455,7 @@ public:
             break;
 
         case NavKey::ENTER:
-            // Enviar mensaje si hay algo escrito
+            // Send message if there is input
             if (inputBuffer.length() > 0) {
                 uint32_t dest = conv->isBroadcast ? kBroadcastAddr : conv->peer;
                 if (!gMesh.isConnected()) {
@@ -1481,7 +1481,7 @@ public:
                 }
 
                 inputBuffer = "";
-                // Ir al final para ver el mensaje enviado
+                // Jump to bottom to show the sent message
                 conv->firstVisibleIndex = -1;
             }
             break;
@@ -1494,12 +1494,12 @@ public:
     void handleChars(const std::vector<char>& chars) override {
         for (char c : chars) {
             if (c == '\b') {
-                // Backspace: borrar último carácter del input
+                // Backspace: delete last input character
                 if (inputBuffer.length() > 0) {
                     inputBuffer.remove(inputBuffer.length() - 1);
                 }
             } else if (c >= 32 && c <= 126) {
-                // Caracter imprimible ASCII
+                // Printable ASCII character
                 inputBuffer += c;
             }
         }
@@ -1513,7 +1513,7 @@ public:
         int w = d.width();
         int h = d.height();
 
-        // Layout: header pequeño, mensajes, input abajo
+        // Layout: small header, messages, input at bottom
         const int headerH = 30;
         const int inputH  = 12;
         const int topY    = headerH + 4;
@@ -1569,7 +1569,7 @@ public:
             const Message& msg = conv->messages[i];
             d.setCursor(2, y);
 
-            // Prefijo simple
+            // Simple prefix
             if (msg.fromMe) {
                 d.print("Me> ");
             } else {
@@ -1582,7 +1582,7 @@ public:
             y += lineH;
         }
 
-        // Input line at bottom: muestra el buffer
+        // Input line at bottom: show the buffer
         d.fillRect(0, h - inputH, w, inputH, BLACK);
         d.setCursor(2, h - inputH + 1);
         d.print("> ");
@@ -1735,7 +1735,7 @@ void ScreenManager::loop() {
     }
 
     NavKey nk = NavKey::NONE;
-    std::vector<char> textChars;   // chars que se envían a la pantalla (chat)
+    std::vector<char> textChars;   // chars sent to the current screen (chat)
 
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
         Keyboard_Class::KeysState st = M5Cardputer.Keyboard.keysState();
@@ -1743,41 +1743,41 @@ void ScreenManager::loop() {
         bool isChat = (currentId == ScreenId::CHAT);
 
         if (isChat) {
-            // --- MODO CHAT ---
+            // --- CHAT MODE ---
             if (st.enter) {
-                nk = NavKey::ENTER;   // enviar mensaje
+                nk = NavKey::ENTER;   // send message
             }
             else if (st.del) {
-                // Backspace: con FN = salir, sin FN = borrar texto
+                // Backspace: with FN = exit, without FN = delete text
                 if (st.fn) {
-                    nk = NavKey::ESC;     // volver al Home
+                    nk = NavKey::ESC;     // go back to Home
                 } else {
-                    textChars.push_back('\b'); // backspace en el input
+                    textChars.push_back('\b'); // backspace in the input
                 }
             }
             else {
-                // En chat:
-                // - Si FN está apretado: usamos ; . , / como flechas (no se agregan a texto)
-                // - Si NO está FN: TODO lo que llegue va a texto (incluidos ; . , /, w, s, etc.)
+                // In chat:
+                // - With FN held: use ; . , / as arrows (do not insert text)
+                // - Without FN: everything is text (including ; . , /, w, s, etc.)
 
                 if (st.fn) {
-                    // FN + key => navegación
+                    // FN + key => navigation
                     bool fast = st.shift;
                     for (auto c : st.word) {
                         switch (c) {
-                        case ';':   // tecla con flecha ARRIBA
+                        case ';':   // key with UP arrow
                         case ':':   // shift + ;
                             nk = fast ? NavKey::UP_FAST : NavKey::UP;
                             break;
-                        case '.':   // tecla con flecha ABAJO
+                        case '.':   // key with DOWN arrow
                         case '>':   // shift + .
                             nk = fast ? NavKey::DOWN_FAST : NavKey::DOWN;
                             break;
-                        case ',':   // tecla con flecha IZQ => back
+                        case ',':   // key with LEFT arrow => back
                         case '<':   // shift + ,
                             nk = NavKey::ESC;
                             break;
-                        case '/':   // tecla con flecha DER => ENTER de navegación
+                        case '/':   // key with RIGHT arrow => navigation enter
                         case '?':   // shift + /
                             nk = NavKey::ENTER;
                             break;
@@ -1789,14 +1789,14 @@ void ScreenManager::loop() {
                         }
                     }
                 } else {
-                    // Sin FN: todos los caracteres son texto
+                    // Without FN: all characters are text
                     for (auto c : st.word) {
                         textChars.push_back(c);
                     }
                 }
             }
         } else {
-            // --- MODO MENÚ / NO-CHAT ---
+            // --- MENU / NON-CHAT MODE ---
             // 1) Enter
             if (st.enter) {
                 nk = NavKey::ENTER;
@@ -1856,13 +1856,13 @@ void ScreenManager::loop() {
         }
     }
 
-    // Primero pasamos las letras crudas a la pantalla actual (si le interesan)
+    // First, pass raw characters to the current screen (if it cares)
     if (!textChars.empty() && currentScreen) {
         currentScreen->handleChars(textChars);
         needRedraw = true;
     }
 
-    // Luego manejo de navegación
+    // Then handle navigation
     if (nk != NavKey::NONE) {
         handleNav(nk);
     }
@@ -1875,14 +1875,14 @@ void ScreenManager::loop() {
 ScreenManager gScreens;
 
 void setup() {
-    Serial.begin(115200);      // <<< agregar
+    Serial.begin(115200);      // serial debug
 
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
 
     M5Cardputer.Display.setRotation(1);
 
-    gMesh.begin();     // futuro: init BLE
+    gMesh.begin();     // init BLE
     gScreens.begin();
     gSdReady = initStorage();
     gLastSdAttemptMs = millis();
@@ -1891,6 +1891,6 @@ void setup() {
 
 
 void loop() {
-    gMesh.loop();      // futuro: event handling BLE
+    gMesh.loop();      // BLE event handling
     gScreens.loop();
 }

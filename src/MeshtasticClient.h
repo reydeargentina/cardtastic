@@ -5,7 +5,7 @@
 #include <vector>
 #include <NimBLEDevice.h>
 
-// Estado de la conexión BLE con el nodo Meshtastic
+// BLE connection state to the Meshtastic node
 enum class ConnectionStatus {
     DISCONNECTED,
     SCANNING,
@@ -14,13 +14,13 @@ enum class ConnectionStatus {
     ERROR
 };
 
-// Info mínima de un dispositivo BLE encontrado en el scan
+// Minimal info for a BLE device found during scan
 struct MeshDeviceInfo {
     String name;
-    String id;   // MAC en texto ("00:4b:12:b1:19:f6")
+    String id;   // MAC address as text ("00:4b:12:b1:19:f6")
 };
 
-// Info mínima de un nodo Meshtastic conocido
+// Minimal info for a known Meshtastic node
 struct MeshNodeInfo {
     uint32_t num = 0;
     String   longName;
@@ -39,7 +39,7 @@ struct MeshNodeInfo {
     uint32_t lastUpdateMs = 0;
 };
 
-// Mensaje de texto recibido desde Meshtastic (cola para la UI)
+// Text message received from Meshtastic (queued for the UI)
 struct MeshTextMessage {
     uint32_t from;
     uint32_t to;
@@ -48,7 +48,7 @@ struct MeshTextMessage {
     String   text;
 };
 
-// Info de canales conocidos (config del nodo)
+// Known channel info (from node config)
 struct MeshChannelInfo {
     int8_t   index = -1;
     String  name;
@@ -69,47 +69,47 @@ public:
     using ScanProgressCallback = void (*)(int secondsLeft, int attempt, int attempts);
     void setScanProgressCallback(ScanProgressCallback cb) { _scanProgressCb = cb; }
 
-    // ---- Estado general ----
+    // ---- General state ----
     ConnectionStatus status()      const { return _status; }
     const String&    radioName()   const { return _radioName; }
     const String&    lastError()   const { return _lastError; }
     bool             isScanning()  const { return _scanning; }
     bool             isConnected() const { return _status == ConnectionStatus::CONNECTED; }
 
-    // ---- Escaneo y dispositivos ----
+    // ---- Scan and devices ----
     void          startScan();
     bool          discoverMeshtasticService();
     int           getDeviceCount() const;
     MeshDeviceInfo getDeviceInfo(int index) const;
 
-    // ---- Nodos conocidos ----
+    // ---- Known nodes ----
     int           getNodeCount() const;
     MeshNodeInfo  getNodeInfo(int index) const;
     void          noteNode(uint32_t num);
 
-    // ---- Canales conocidos ----
+    // ---- Known channels ----
     int            getChannelCount() const;
     MeshChannelInfo getChannelInfo(int index) const;
     String         channelLabel(uint8_t index) const;
 
-    // ---- Conexión / debug ----
+    // ---- Connection / debug ----
     bool connectToIndex(int index);
     void debugDumpServices();
     void disconnect();
     void handleDisconnect(int reason);
 
-    // ---- Mensajes entrantes (texto) ----
+    // ---- Incoming messages (text) ----
     bool     popTextMessage(MeshTextMessage& out);
     uint32_t myNodeNum() const { return _myNodeNum; }
     String   nodeLabel(uint32_t nodeNum) const;
 
-    // ---- Mensajes salientes ----
+    // ---- Outgoing messages ----
     bool requestConfig();
     bool sendTextMessage(const String& text, uint32_t dest = 0xFFFFFFFF, uint8_t channel = 0);
     void setPasskey(uint32_t passkey);
 
 private:
-    // --- helpers internos ---
+    // --- Internal helpers ---
     void pullFromRadioUntilEmpty(bool logEmpty = true);
     bool decodeFromRadioAndQueue(const uint8_t* data, size_t len);
     MeshNodeInfo* getOrCreateNode(uint32_t num);
@@ -146,5 +146,5 @@ private:
     NimBLERemoteCharacteristic* _charLog;        // 5a3d... (notify)
 };
 
-// Instancia global, igual que antes usabas gMesh
+// Global instance (same gMesh usage as before)
 extern MeshtasticClient gMesh;
