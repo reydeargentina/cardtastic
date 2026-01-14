@@ -38,6 +38,7 @@ monitor_port = /dev/serial/by-id/usb-...
 ```
 
 ## Usage
+It's important to note that Cardtastic is intendend to be used as a simple UI to interact with an already configured node. The use case I thought about is to use it to read and send messages when I'm on the go, so I don't have to use my phone. As a result, it will not be useful to configure the node for the first time.
 - Connect: use Scan to find radios, then connect.
 - Conversations: open recent chats; unread messages show a `*`.
 - Channels: open a broadcast chat by channel.
