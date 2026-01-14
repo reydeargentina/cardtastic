@@ -1,8 +1,13 @@
+#include <SD.h>
+#include <SPI.h>
+#include <ArduinoJson.h>
+#include <stdlib.h>
 #include "M5Cardputer.h"
 #include <vector>
 #include <NimBLEDevice.h> 
 #include <string>
 #include "MeshtasticClient.h"
+#include "meshtastic/channel.pb.h"
 
 // -------------------- Basic navigation --------------------
 
@@ -19,6 +24,9 @@ enum class NavKey {
 // -------------------- Conversation / Message model (RAM only for now) --------------------
 
 constexpr uint32_t kBroadcastAddr = 0xFFFFFFFF;
+constexpr size_t kConversationMaxMessages = 50;
+constexpr size_t kConversationJsonMax = 32768;
+const char* kStorageDir = "/cardtastic";
 
 struct Message {
     bool   fromMe;  // true = this UI, false = remote node
@@ -40,19 +48,239 @@ static int gActiveConversation = -1;
 static int gSelectedNodeIndex = -1;
 
 constexpr uint32_t kNodeActiveMs = 5UL * 60UL * 1000UL;
+static bool gSdReady = false;
+static uint32_t gLastSdAttemptMs = 0;
+static bool gStorageLoaded = false;
+static uint32_t gLoadedRadioNode = 0;
 
-int findConversationIndex(uint32_t peer, bool isBroadcast) {
+Conversation* getConversation(int index);
+int ensureConversation(uint32_t peer, bool isBroadcast, uint8_t channel);
+void initConversations();
+
+bool initStorage() {
+    int cs = M5.getPin(m5::sd_spi_cs);
+    int sck = M5.getPin(m5::sd_spi_sclk);
+    int mosi = M5.getPin(m5::sd_spi_mosi);
+    int miso = M5.getPin(m5::sd_spi_miso);
+
+    if (cs < 0 || cs == 255 || sck < 0 || sck == 255 || mosi < 0 || mosi == 255 || miso < 0 || miso == 255) {
+        // Fallback to Cardputer SPI SD pins (per M5Cardputer SD example).
+        sck = 40;
+        miso = 39;
+        mosi = 14;
+        cs = 12;
+    }
+
+    SPI.begin(sck, miso, mosi, cs);
+    if (!SD.begin(cs, SPI, 20000000)) {
+        if (!SD.begin(cs, SPI, 10000000)) {
+            return false;
+        }
+    }
+
+    if (!SD.exists(kStorageDir)) {
+        if (!SD.mkdir(kStorageDir)) {
+            return false;
+        }
+    } else {
+        File dir = SD.open(kStorageDir);
+        if (!dir || !dir.isDirectory()) {
+            if (dir) dir.close();
+            return false;
+        }
+        dir.close();
+    }
+    return true;
+}
+
+bool ensureStorage() {
+    if (gSdReady) return true;
+    uint32_t now = millis();
+    if (now - gLastSdAttemptMs < 3000) return false;
+    gLastSdAttemptMs = now;
+    gSdReady = initStorage();
+    return gSdReady;
+}
+
+String nodeHexId(uint32_t num) {
+    char buf[9];
+    snprintf(buf, sizeof(buf), "%08lX", (unsigned long)num);
+    return String(buf);
+}
+
+uint32_t parsePeerFromFilename(const String& name) {
+    int slash = name.lastIndexOf('/');
+    String base = (slash >= 0) ? name.substring(slash + 1) : name;
+    if (!base.startsWith("dm_")) return 0;
+    int dot = base.lastIndexOf('.');
+    String hex = (dot > 3) ? base.substring(3, dot) : base.substring(3);
+    if (hex.length() == 0) return 0;
+    char* end = nullptr;
+    uint32_t value = strtoul(hex.c_str(), &end, 16);
+    if (!end || *end != '\0') return 0;
+    return value;
+}
+
+String conversationFilePath(const Conversation& conv) {
+    if (conv.isBroadcast) {
+        return String(kStorageDir) + "/ch_" + String(conv.channel) + ".json";
+    }
+    return String(kStorageDir) + "/dm_" + nodeHexId(conv.peer) + ".json";
+}
+
+void persistConversation(int convIndex) {
+    if (!ensureStorage()) return;
+    Conversation* conv = getConversation(convIndex);
+    if (!conv) return;
+
+    DynamicJsonDocument doc(kConversationJsonMax);
+    doc["version"] = 1;
+    uint32_t radio = gMesh.myNodeNum();
+    if (radio != 0) {
+        doc["radio"] = radio;
+    }
+    doc["peer"] = conv->peer;
+    doc["broadcast"] = conv->isBroadcast;
+    doc["channel"] = conv->channel;
+    doc["unread"] = conv->hasUnread;
+
+    JsonArray arr = doc.createNestedArray("messages");
+    size_t total = conv->messages.size();
+    size_t start = (total > kConversationMaxMessages) ? (total - kConversationMaxMessages) : 0;
+    for (size_t i = start; i < total; ++i) {
+        const auto& msg = conv->messages[i];
+        JsonObject obj = arr.createNestedObject();
+        obj["from"] = msg.from;
+        obj["fromMe"] = msg.fromMe;
+        obj["text"] = msg.text;
+    }
+
+    String path = conversationFilePath(*conv);
+    if (SD.exists(path)) {
+        SD.remove(path);
+    }
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) {
+        gSdReady = false;
+        gStorageLoaded = false;
+        return;
+    }
+    serializeJson(doc, f);
+    f.close();
+}
+
+void loadConversationsFromStorage() {
+    if (!ensureStorage()) return;
+    uint32_t currentRadio = gMesh.myNodeNum();
+
+    File dir = SD.open(kStorageDir);
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        return;
+    }
+
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        if (f.isDirectory()) {
+            f.close();
+            continue;
+        }
+        String name = String(f.name());
+        if (!name.endsWith(".json")) {
+            f.close();
+            continue;
+        }
+
+        size_t cap = f.size() * 2 + 512;
+        if (cap < 2048) cap = 2048;
+        if (cap > kConversationJsonMax) cap = kConversationJsonMax;
+        DynamicJsonDocument doc(cap);
+
+        DeserializationError err = deserializeJson(doc, f);
+        f.close();
+        if (err) {
+            continue;
+        }
+
+        uint32_t peer = doc["peer"] | 0;
+        bool isBroadcast = doc["broadcast"] | false;
+        uint8_t channel = doc["channel"] | 0;
+        bool unread = doc["unread"] | false;
+        uint32_t radio = doc["radio"] | 0;
+        if (isBroadcast && peer == 0) peer = kBroadcastAddr;
+        if (!isBroadcast && peer == 0) {
+            peer = parsePeerFromFilename(name);
+        }
+        if (peer == 0) {
+            continue;
+        }
+        if (radio != 0 && currentRadio != 0 && radio != currentRadio) {
+            continue;
+        }
+
+        int convIndex = ensureConversation(peer, isBroadcast, channel);
+        Conversation* conv = getConversation(convIndex);
+        if (!conv) continue;
+
+        if (!conv->messages.empty()) {
+            continue;
+        }
+
+        conv->peer = peer;
+        conv->isBroadcast = isBroadcast;
+        conv->channel = channel;
+        conv->messages.clear();
+        conv->hasUnread = unread;
+        conv->firstVisibleIndex = -1;
+
+        JsonArray msgs = doc["messages"].as<JsonArray>();
+        if (msgs.isNull()) continue;
+        for (JsonObject obj : msgs) {
+            Message m;
+            m.from = obj["from"] | 0;
+            m.fromMe = obj["fromMe"] | false;
+            const char* txt = obj["text"] | "";
+            m.text = String(txt);
+            conv->messages.push_back(m);
+        }
+
+        if (conv->messages.size() > kConversationMaxMessages) {
+            size_t remove = conv->messages.size() - kConversationMaxMessages;
+            conv->messages.erase(conv->messages.begin(), conv->messages.begin() + remove);
+        }
+    }
+    dir.close();
+}
+
+bool tryLoadConversationsOnce() {
+    uint32_t currentRadio = gMesh.myNodeNum();
+    if (currentRadio == 0) return false;
+    if (gStorageLoaded && gLoadedRadioNode == currentRadio) return false;
+    if (!ensureStorage()) return false;
+
+    if (gLoadedRadioNode != 0 && gLoadedRadioNode != currentRadio) {
+        initConversations();
+    }
+
+    gLoadedRadioNode = currentRadio;
+    loadConversationsFromStorage();
+    gStorageLoaded = true;
+    return true;
+}
+
+int findConversationIndex(uint32_t peer, bool isBroadcast, uint8_t channel) {
     for (int i = 0; i < (int)gConversations.size(); ++i) {
         const auto& c = gConversations[i];
         if (c.peer == peer && c.isBroadcast == isBroadcast) {
-            return i;
+            if (!isBroadcast || c.channel == channel) {
+                return i;
+            }
         }
     }
     return -1;
 }
 
 int ensureConversation(uint32_t peer, bool isBroadcast, uint8_t channel) {
-    int idx = findConversationIndex(peer, isBroadcast);
+    int idx = findConversationIndex(peer, isBroadcast, channel);
     if (idx >= 0) return idx;
     Conversation c;
     c.peer = peer;
@@ -70,7 +298,7 @@ Conversation* getConversation(int index) {
 }
 
 String conversationTitle(const Conversation& conv) {
-    if (conv.isBroadcast) return "LongFast";
+    if (conv.isBroadcast) return gMesh.channelLabel(conv.channel);
     return gMesh.nodeLabel(conv.peer);
 }
 
@@ -84,6 +312,26 @@ String nodeDisplayName(const MeshNodeInfo& node) {
     if (node.shortName.length() > 0) return node.shortName;
     if (node.longName.length() > 0) return node.longName;
     return nodeHex(node.num);
+}
+
+String channelDisplayName(const MeshChannelInfo& ch) {
+    if (ch.name.length() > 0) return ch.name;
+    if (ch.index == 0) return "LongFast";
+    return String("Ch ") + ch.index;
+}
+
+const char* channelRoleLabel(uint8_t role) {
+    switch (role) {
+    case meshtastic_Channel_Role_PRIMARY:
+        return "P";
+    case meshtastic_Channel_Role_SECONDARY:
+        return "S";
+    case meshtastic_Channel_Role_DISABLED:
+        return "D";
+    default:
+        break;
+    }
+    return "?";
 }
 
 String formatAge(uint32_t lastUpdateMs) {
@@ -187,12 +435,17 @@ void appendConversationMessage(int convIndex,
     if (!conv) return;
     bool autoBottom = (conv->firstVisibleIndex < 0);
     conv->messages.push_back({fromMe, from, text});
+    if (conv->messages.size() > kConversationMaxMessages) {
+        size_t remove = conv->messages.size() - kConversationMaxMessages;
+        conv->messages.erase(conv->messages.begin(), conv->messages.begin() + remove);
+    }
     if (autoBottom) {
         conv->firstVisibleIndex = -1;
     }
     if (markUnread) {
         conv->hasUnread = true;
     }
+    persistConversation(convIndex);
 }
 
 // -------------------- Generic list menu helper --------------------
@@ -316,6 +569,7 @@ enum class ScreenId {
     HOME,
     CONNECT,
     NODES,
+    CHANNELS,
     NODE_ACTIONS,
     NODE_INFO,
     CONVERSATIONS,
@@ -326,6 +580,7 @@ enum class ScreenId {
 class HomeScreen;
 class ConnectScreen;
 class NodesScreen;
+class ChannelsScreen;
 class NodeActionsScreen;
 class NodeInfoScreen;
 class ConversationsScreen;
@@ -353,6 +608,7 @@ private:
     HomeScreen*          home;
     ConnectScreen*       connect;
     NodesScreen*         nodes;
+    ChannelsScreen*      channels;
     NodeActionsScreen*   nodeActions;
     NodeInfoScreen*      nodeInfo;
     ConversationsScreen* convs;
@@ -371,7 +627,7 @@ public:
     HomeScreen() {
         items.push_back({"Connect", true});
         items.push_back({"Nodes", true});
-        items.push_back({"Channels (TODO)", true});
+        items.push_back({"Channels", true});
         items.push_back({"Conversations", true});
     }
 
@@ -717,6 +973,115 @@ private:
     }
 };
 
+// -------------------- Channels screen --------------------
+
+class ChannelsScreen : public Screen {
+public:
+    void onEnter() override {
+        menu.reset();
+    }
+
+    void handleNav(NavKey k) override {
+        int count = getItemCount();
+        switch (k) {
+        case NavKey::UP:
+        case NavKey::DOWN:
+        case NavKey::UP_FAST:
+        case NavKey::DOWN_FAST:
+            menu.handleNav(k, count);
+            break;
+        case NavKey::ENTER:
+            openChannel();
+            break;
+        default:
+            break;
+        }
+    }
+
+    void draw() override {
+        auto& d = M5Cardputer.Display;
+        d.fillScreen(BLACK);
+        d.setTextColor(WHITE, BLACK);
+
+        d.setTextSize(1);
+        d.setCursor(4, 4);
+        d.println("Channels");
+        d.setCursor(4, 14);
+        d.print("BLE: ");
+        d.println(connectionStatusLabel());
+
+        int count = gMesh.getChannelCount();
+        if (count == 0) {
+            d.setCursor(4, 26);
+            d.println("No channels yet");
+        }
+
+        const int startY = 32;
+        const int lineH  = 22;
+        int screenH = d.height();
+        int visibleRows = (screenH - 10 - startY) / lineH;
+        if (visibleRows < 1) visibleRows = 1;
+
+        menu.ensureVisible(count, visibleRows);
+        int top = menu.topIndex();
+
+        d.setTextSize(2);
+        for (int i = top; i < count && i < top + visibleRows; ++i) {
+            int y = startY + (i - top) * lineH;
+            MeshChannelInfo info = gMesh.getChannelInfo(i);
+
+            if (i == menu.current()) {
+                d.fillRect(0, y - 2, d.width(), lineH, DARKGREY);
+                d.setTextColor(BLACK, DARKGREY);
+            } else {
+                d.setTextColor(WHITE, BLACK);
+            }
+
+            String label = String(info.index) + " " + channelDisplayName(info);
+            label += " ";
+            label += channelRoleLabel(info.role);
+            if (info.muted) {
+                label += " [M]";
+            }
+
+            d.setCursor(6, y);
+            d.println(label);
+        }
+
+        d.setTextSize(1);
+        int h = d.height();
+        d.fillRect(0, h - 10, d.width(), 10, BLACK);
+        d.setCursor(4, h - 9);
+        d.print("Enter/Right: open  Backspace/Left: back  Shift: page");
+    }
+
+private:
+    ListMenuState menu;
+
+    int getItemCount() const {
+        return gMesh.getChannelCount();
+    }
+
+    void openChannel() {
+        int count = getItemCount();
+        if (count <= 0) return;
+        int sel = menu.current();
+        if (sel < 0 || sel >= count) return;
+
+        MeshChannelInfo info = gMesh.getChannelInfo(sel);
+        if (info.index < 0) return;
+
+        int convIndex = ensureConversation(kBroadcastAddr, true, (uint8_t)info.index);
+        gActiveConversation = convIndex;
+        Conversation* conv = getConversation(convIndex);
+        if (conv) {
+            conv->hasUnread = false;
+            persistConversation(convIndex);
+        }
+        gScreens.switchTo(ScreenId::CHAT);
+    }
+};
+
 // -------------------- Node actions screen --------------------
 
 class NodeActionsScreen : public Screen {
@@ -805,7 +1170,10 @@ private:
             int convIndex = ensureConversation(node.num, false, 0);
             gActiveConversation = convIndex;
             Conversation* conv = getConversation(convIndex);
-            if (conv) conv->hasUnread = false;
+            if (conv) {
+                conv->hasUnread = false;
+                persistConversation(convIndex);
+            }
             gScreens.switchTo(ScreenId::CHAT);
         } else if (sel == 1) {
             gScreens.switchTo(ScreenId::NODE_INFO);
@@ -1036,6 +1404,7 @@ public:
         if (conv) {
             conv->hasUnread = false;
             conv->firstVisibleIndex = -1;
+            persistConversation(gActiveConversation);
         }
     }
 
@@ -1230,6 +1599,7 @@ void ScreenManager::begin() {
     home    = new HomeScreen();
     connect = new ConnectScreen();
     nodes   = new NodesScreen();
+    channels = new ChannelsScreen();
     nodeActions = new NodeActionsScreen();
     nodeInfo = new NodeInfoScreen();
     convs   = new ConversationsScreen();
@@ -1248,6 +1618,7 @@ Screen* ScreenManager::getScreenById(ScreenId id) {
     case ScreenId::HOME:          return home;
     case ScreenId::CONNECT:       return connect;
     case ScreenId::NODES:         return nodes;
+    case ScreenId::CHANNELS:      return channels;
     case ScreenId::NODE_ACTIONS:  return nodeActions;
     case ScreenId::NODE_INFO:     return nodeInfo;
     case ScreenId::CONVERSATIONS: return convs;
@@ -1292,11 +1663,14 @@ void ScreenManager::handleNav(NavKey k) {
         } else if (sel == 1) {
             switchTo(ScreenId::NODES);
             return;
+        } else if (sel == 2) {
+            switchTo(ScreenId::CHANNELS);
+            return;
         } else if (sel == 3) {
             switchTo(ScreenId::CONVERSATIONS);
             return;
         }
-        // "Channels (TODO)" does nothing yet (sel == 2)
+        // Channels handled above
     }
 
     // CONVERSATIONS: ENTER opens the chat (single conversation for now)
@@ -1308,6 +1682,7 @@ void ScreenManager::handleNav(NavKey k) {
             Conversation* conv = getConversation(convIndex);
             if (conv) {
                 conv->hasUnread = false;
+                persistConversation(convIndex);
             }
         }
         switchTo(ScreenId::CHAT);
@@ -1339,6 +1714,10 @@ void ScreenManager::redrawIfNeeded() {
 void ScreenManager::loop() {
     // Update Cardputer (keyboard, etc.)
     M5Cardputer.update();
+
+    if (tryLoadConversationsOnce()) {
+        needRedraw = true;
+    }
 
     bool gotMessage = false;
     MeshTextMessage msg;
@@ -1505,6 +1884,9 @@ void setup() {
 
     gMesh.begin();     // futuro: init BLE
     gScreens.begin();
+    gSdReady = initStorage();
+    gLastSdAttemptMs = millis();
+    tryLoadConversationsOnce();
 }
 
 

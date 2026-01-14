@@ -48,6 +48,17 @@ struct MeshTextMessage {
     String   text;
 };
 
+// Info de canales conocidos (config del nodo)
+struct MeshChannelInfo {
+    int8_t   index = -1;
+    String  name;
+    uint8_t role = 0;
+    bool    muted = false;
+    bool    uplink = false;
+    bool    downlink = false;
+    bool    hasSettings = false;
+};
+
 class MeshtasticClient {
 public:
     MeshtasticClient();
@@ -76,6 +87,11 @@ public:
     MeshNodeInfo  getNodeInfo(int index) const;
     void          noteNode(uint32_t num);
 
+    // ---- Canales conocidos ----
+    int            getChannelCount() const;
+    MeshChannelInfo getChannelInfo(int index) const;
+    String         channelLabel(uint8_t index) const;
+
     // ---- Conexión / debug ----
     bool connectToIndex(int index);
     void debugDumpServices();
@@ -97,6 +113,7 @@ private:
     void pullFromRadioUntilEmpty(bool logEmpty = true);
     bool decodeFromRadioAndQueue(const uint8_t* data, size_t len);
     MeshNodeInfo* getOrCreateNode(uint32_t num);
+    MeshChannelInfo* getOrCreateChannel(int8_t index);
     void resetConnectionState(bool clearNodes);
     void handleFromNumNotify(NimBLERemoteCharacteristic* chr,
                              uint8_t* data, size_t len, bool isNotify);
@@ -118,6 +135,7 @@ private:
     std::deque<MeshTextMessage> _rxTextQueue;
     std::vector<MeshDeviceInfo> _devices;
     std::vector<MeshNodeInfo>   _nodes;
+    std::vector<MeshChannelInfo> _channels;
     NimBLEClient*               _client;
     ScanProgressCallback        _scanProgressCb = nullptr;
 

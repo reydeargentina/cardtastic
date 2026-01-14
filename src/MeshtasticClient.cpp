@@ -84,6 +84,7 @@ void MeshtasticClient::begin() {
     _rxTextQueue.clear();
     _devices.clear();
     _nodes.clear();
+    _channels.clear();
     _scanProgressCb = nullptr;
 
     _client         = nullptr;
@@ -124,10 +125,11 @@ void MeshtasticClient::startScan() {
     pScan->setActiveScan(true);        // pedir más info (nombre, etc.)
     pScan->setInterval(160);           // 100 ms
     pScan->setWindow(80);              //  50 ms (<= interval)
-    pScan->setDuplicateFilter(true);   // no queremos el mismo dev mil veces
+    pScan->setDuplicateFilter(false);  // dejamos duplicados y deduplicamos por MAC
     pScan->clearResults();             // limpiar resultados previos
 
     int totalFound = 0;
+    static NimBLEUUID meshSvcUuid("6ba1b218-15a8-461f-9fa8-5dcae273eafd");
     for (int attempt = 0; attempt < kScanAttempts; ++attempt) {
         Serial.printf("[Mesh] Scan attempt %d/%d\n", attempt + 1, kScanAttempts);
         uint32_t startMs = millis();
@@ -171,9 +173,14 @@ void MeshtasticClient::startScan() {
 
             std::string name = dev->getName();
             std::string addr = dev->getAddress().toString();
+            bool isMesh = dev->isAdvertisingService(meshSvcUuid);
 
-            Serial.printf("[Mesh] Dev %d: name='%s' addr=%s\n",
-                          i, name.c_str(), addr.c_str());
+            Serial.printf("[Mesh] Dev %d: name='%s' addr=%s mesh=%d\n",
+                          i, name.c_str(), addr.c_str(), isMesh ? 1 : 0);
+
+            if (!isMesh) {
+                continue;
+            }
 
             if (name.empty()) {
                 name = addr;
@@ -256,6 +263,44 @@ MeshNodeInfo* MeshtasticClient::getOrCreateNode(uint32_t num) {
     return &_nodes.back();
 }
 
+int MeshtasticClient::getChannelCount() const {
+    return (int)_channels.size();
+}
+
+MeshChannelInfo MeshtasticClient::getChannelInfo(int index) const {
+    MeshChannelInfo dummy;
+    if (index < 0 || index >= (int)_channels.size()) return dummy;
+    return _channels[index];
+}
+
+String MeshtasticClient::channelLabel(uint8_t index) const {
+    for (const auto& ch : _channels) {
+        if (ch.index == (int8_t)index) {
+            if (ch.name.length() > 0) return ch.name;
+            break;
+        }
+    }
+    if (index == 0) return String("LongFast");
+    return String("Channel ") + index;
+}
+
+MeshChannelInfo* MeshtasticClient::getOrCreateChannel(int8_t index) {
+    if (index < 0) return nullptr;
+    for (auto& ch : _channels) {
+        if (ch.index == index) return &ch;
+    }
+    MeshChannelInfo entry;
+    entry.index = index;
+    for (auto it = _channels.begin(); it != _channels.end(); ++it) {
+        if (it->index > index) {
+            _channels.insert(it, entry);
+            return &(*it);
+        }
+    }
+    _channels.push_back(entry);
+    return &_channels.back();
+}
+
 void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _svc           = nullptr;
     _charToRadio   = nullptr;
@@ -274,6 +319,7 @@ void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _lastPollMs     = 0;
     _lastFromNum    = 0;
     _rxTextQueue.clear();
+    _channels.clear();
     if (clearNodes) {
         _nodes.clear();
     }
@@ -433,6 +479,7 @@ bool MeshtasticClient::connectToIndex(int index) {
 
     _rxTextQueue.clear();
     _nodes.clear();
+    _channels.clear();
     _needsPull = false;
     _configRequested = false;
     _configComplete = false;
@@ -719,6 +766,27 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
         }
 
         node->lastUpdateMs = millis();
+        return true;
+    }
+
+    if (fr.which_payload_variant == meshtastic_FromRadio_channel_tag) {
+        const meshtastic_Channel& ch = fr.channel;
+        MeshChannelInfo* entry = getOrCreateChannel(ch.index);
+        if (!entry) return true;
+
+        entry->role = ch.role;
+        entry->hasSettings = ch.has_settings;
+        if (ch.has_settings) {
+            entry->name = String(ch.settings.name);
+            entry->uplink = ch.settings.uplink_enabled;
+            entry->downlink = ch.settings.downlink_enabled;
+            entry->muted = ch.settings.has_module_settings && ch.settings.module_settings.is_muted;
+        } else {
+            entry->name = "";
+            entry->uplink = false;
+            entry->downlink = false;
+            entry->muted = false;
+        }
         return true;
     }
 
