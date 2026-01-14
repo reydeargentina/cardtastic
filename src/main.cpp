@@ -28,6 +28,7 @@ constexpr uint32_t kBroadcastAddr = 0xFFFFFFFF;
 constexpr size_t kConversationMaxMessages = 50;
 constexpr size_t kConversationJsonMax = 32768;
 const char* kStorageDir = "/cardtastic";
+constexpr uint32_t kScreenIdleMs = 60000;
 
 constexpr uint16_t kColorBodyBg = BLACK;
 constexpr uint16_t kColorBodyText = WHITE;
@@ -78,6 +79,8 @@ static bool gSdReady = false;
 static uint32_t gLastSdAttemptMs = 0;
 static bool gStorageLoaded = false;
 static uint32_t gLoadedRadioNode = 0;
+static uint32_t gLastInputMs = 0;
+static bool gScreenSleeping = false;
 
 Conversation* getConversation(int index);
 int ensureConversation(uint32_t peer, bool isBroadcast, uint8_t channel);
@@ -1870,6 +1873,24 @@ void ScreenManager::loop() {
     // Update Cardputer (keyboard, etc.)
     M5Cardputer.update();
 
+    uint32_t now = millis();
+    bool keyChanged = M5Cardputer.Keyboard.isChange();
+    if (keyChanged) {
+        gLastInputMs = now;
+        if (gScreenSleeping) {
+            M5Cardputer.Display.wakeup();
+            gScreenSleeping = false;
+            needRedraw = true;
+            return;
+        }
+    }
+
+    if (!gScreenSleeping && kScreenIdleMs > 0 && (now - gLastInputMs) > kScreenIdleMs) {
+        M5Cardputer.Display.sleep();
+        gScreenSleeping = true;
+        return;
+    }
+
     if (tryLoadConversationsOnce()) {
         needRedraw = true;
     }
@@ -1892,7 +1913,7 @@ void ScreenManager::loop() {
     NavKey nk = NavKey::NONE;
     std::vector<char> textChars;   // chars sent to the current screen (chat)
 
-    if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+    if (keyChanged && M5Cardputer.Keyboard.isPressed()) {
         Keyboard_Class::KeysState st = M5Cardputer.Keyboard.keysState();
 
         bool isChat = (currentId == ScreenId::CHAT);
@@ -2041,6 +2062,7 @@ void setup() {
     gScreens.begin();
     gSdReady = initStorage();
     gLastSdAttemptMs = millis();
+    gLastInputMs = millis();
     tryLoadConversationsOnce();
 }
 
