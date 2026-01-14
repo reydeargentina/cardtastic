@@ -1,6 +1,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <ArduinoJson.h>
+#include <algorithm>
 #include <stdlib.h>
 #include "M5Cardputer.h"
 #include <vector>
@@ -28,6 +29,29 @@ constexpr size_t kConversationMaxMessages = 50;
 constexpr size_t kConversationJsonMax = 32768;
 const char* kStorageDir = "/cardtastic";
 
+constexpr uint16_t kColorBodyBg = BLACK;
+constexpr uint16_t kColorBodyText = WHITE;
+constexpr uint16_t kColorHeaderBg = DARKGREEN;
+constexpr uint16_t kColorHeaderText = WHITE;
+constexpr uint16_t kColorFooterBg = DARKGREEN;
+constexpr uint16_t kColorFooterText = WHITE;
+constexpr uint16_t kColorSeparator = GREEN;
+constexpr int kFooterH = 10;
+
+void drawHeaderBackground(int height) {
+    if (height <= 0) return;
+    auto& d = M5Cardputer.Display;
+    d.fillRect(0, 0, d.width(), height, kColorHeaderBg);
+    d.drawFastHLine(0, height - 1, d.width(), kColorSeparator);
+}
+
+void drawFooterBackground() {
+    auto& d = M5Cardputer.Display;
+    int h = d.height();
+    d.fillRect(0, h - kFooterH, d.width(), kFooterH, kColorFooterBg);
+    d.drawFastHLine(0, h - kFooterH, d.width(), kColorSeparator);
+}
+
 struct Message {
     bool   fromMe;  // true = this UI, false = remote node
     uint32_t from;
@@ -41,11 +65,13 @@ struct Conversation {
     std::vector<Message> messages;
     int                  firstVisibleIndex;  // -1 = auto-bottom
     bool                 hasUnread;
+    uint32_t             lastActivitySeq;
 };
 
 static std::vector<Conversation> gConversations;
 static int gActiveConversation = -1;
 static int gSelectedNodeIndex = -1;
+static uint32_t gNextActivitySeq = 1;
 
 constexpr uint32_t kNodeActiveMs = 5UL * 60UL * 1000UL;
 static bool gSdReady = false;
@@ -143,6 +169,7 @@ void persistConversation(int convIndex) {
     doc["broadcast"] = conv->isBroadcast;
     doc["channel"] = conv->channel;
     doc["unread"] = conv->hasUnread;
+    doc["lastActivity"] = conv->lastActivitySeq;
 
     JsonArray arr = doc.createNestedArray("messages");
     size_t total = conv->messages.size();
@@ -172,6 +199,7 @@ void persistConversation(int convIndex) {
 void loadConversationsFromStorage() {
     if (!ensureStorage()) return;
     uint32_t currentRadio = gMesh.myNodeNum();
+    uint32_t maxActivity = 0;
 
     File dir = SD.open(kStorageDir);
     if (!dir || !dir.isDirectory()) {
@@ -206,6 +234,8 @@ void loadConversationsFromStorage() {
         uint8_t channel = doc["channel"] | 0;
         bool unread = doc["unread"] | false;
         uint32_t radio = doc["radio"] | 0;
+        bool hasLastActivity = doc.containsKey("lastActivity");
+        uint32_t lastActivity = doc["lastActivity"] | 0;
         if (isBroadcast && peer == 0) peer = kBroadcastAddr;
         if (!isBroadcast && peer == 0) {
             peer = parsePeerFromFilename(name);
@@ -247,8 +277,18 @@ void loadConversationsFromStorage() {
             size_t remove = conv->messages.size() - kConversationMaxMessages;
             conv->messages.erase(conv->messages.begin(), conv->messages.begin() + remove);
         }
+        if (!hasLastActivity && !conv->messages.empty()) {
+            lastActivity = 1;
+        }
+        conv->lastActivitySeq = lastActivity;
+        if (lastActivity > maxActivity) {
+            maxActivity = lastActivity;
+        }
     }
     dir.close();
+    if (maxActivity >= gNextActivitySeq) {
+        gNextActivitySeq = maxActivity + 1;
+    }
 }
 
 bool tryLoadConversationsOnce() {
@@ -288,6 +328,7 @@ int ensureConversation(uint32_t peer, bool isBroadcast, uint8_t channel) {
     c.channel = channel;
     c.firstVisibleIndex = -1;
     c.hasUnread = false;
+    c.lastActivitySeq = 0;
     gConversations.push_back(c);
     return (int)gConversations.size() - 1;
 }
@@ -300,6 +341,31 @@ Conversation* getConversation(int index) {
 String conversationTitle(const Conversation& conv) {
     if (conv.isBroadcast) return gMesh.channelLabel(conv.channel);
     return gMesh.nodeLabel(conv.peer);
+}
+
+String conversationListTitle(const Conversation& conv) {
+    if (conv.isBroadcast) {
+        return String("[ch") + String(conv.channel) + "] " + gMesh.channelLabel(conv.channel);
+    }
+    return gMesh.nodeLabel(conv.peer);
+}
+
+String lastMessagePreview(const Conversation& conv) {
+    if (conv.messages.empty()) return String("");
+    const Message& msg = conv.messages.back();
+    String text = msg.text;
+    text.replace('\n', ' ');
+    if (msg.fromMe) {
+        return String("Me: ") + text;
+    }
+    return text;
+}
+
+String truncateLabel(const String& text, size_t maxChars) {
+    if (maxChars == 0) return String("");
+    if (text.length() <= maxChars) return text;
+    if (maxChars <= 3) return text.substring(0, maxChars);
+    return text.substring(0, maxChars - 3) + "...";
 }
 
 String nodeHex(uint32_t num) {
@@ -358,18 +424,31 @@ const char* nodeActiveTag(const MeshNodeInfo& node) {
     return isNodeActive(node) ? " [A]" : "";
 }
 
+String batteryStatusLabel() {
+    int32_t level = M5.Power.getBatteryLevel();
+    if (level < 0 || level > 100) {
+        return "BAT --";
+    }
+    String label = "BAT " + String(level) + "%";
+    auto charging = M5.Power.isCharging();
+    if (charging == m5::Power_Class::is_charging_t::is_charging) {
+        label += "+";
+    }
+    return label;
+}
+
 void drawHeaderRightStatus(const String& line1, const String& line2) {
     auto& d = M5Cardputer.Display;
     d.setTextSize(1);
-    d.setTextColor(WHITE, BLACK);
+    d.setTextColor(kColorHeaderText, kColorHeaderBg);
 
     int clearWidth = d.textWidth("Connecting");
     int scanWidth  = d.textWidth("Scan 99s");
     if (scanWidth > clearWidth) clearWidth = scanWidth;
     int x = d.width() - clearWidth - 4;
 
-    d.fillRect(x, 4, clearWidth + 4, 10, BLACK);
-    d.fillRect(x, 14, clearWidth + 4, 10, BLACK);
+    d.fillRect(x, 4, clearWidth + 4, 10, kColorHeaderBg);
+    d.fillRect(x, 14, clearWidth + 4, 10, kColorHeaderBg);
 
     if (line1.length() > 0) {
         d.setCursor(d.width() - d.textWidth(line1) - 4, 4);
@@ -414,6 +493,7 @@ const char* connectionStatusLabel() {
 }
 
 bool hasUnreadConversations() {
+    if (gMesh.myNodeNum() == 0) return false;
     for (const auto& conv : gConversations) {
         if (conv.hasUnread) return true;
     }
@@ -424,6 +504,7 @@ void initConversations() {
     gConversations.clear();
     ensureConversation(kBroadcastAddr, true, 0);
     gActiveConversation = -1;
+    gNextActivitySeq = 1;
 }
 
 void appendConversationMessage(int convIndex,
@@ -445,6 +526,7 @@ void appendConversationMessage(int convIndex,
     if (markUnread) {
         conv->hasUnread = true;
     }
+    conv->lastActivitySeq = gNextActivitySeq++;
     persistConversation(convIndex);
 }
 
@@ -641,11 +723,13 @@ public:
 
     void draw() override {
         auto& d = M5Cardputer.Display;
-        d.fillScreen(BLACK);
-        d.setTextColor(WHITE, BLACK);
+        d.fillScreen(kColorBodyBg);
+        const int headerH = 24;
+        drawHeaderBackground(headerH);
 
         // --- Header (small text) ---
         d.setTextSize(1);
+        d.setTextColor(kColorHeaderText, kColorHeaderBg);
         String title = "Cardtastic 0.1";
         int titleX = (d.width() - d.textWidth(title)) / 2;
         if (titleX < 0) titleX = 0;
@@ -655,10 +739,19 @@ public:
         d.print("BLE: ");
         d.println(connectionStatusLabel());
 
+        String batt = batteryStatusLabel();
+        int battX = d.width() - d.textWidth(batt) - 4;
+        if (battX < 0) battX = 0;
+        int titleRight = titleX + d.textWidth(title);
+        int battY = (battX <= titleRight + 4) ? 14 : 4;
+        d.setCursor(battX, battY);
+        d.print(batt);
+
         // --- Menu (bigger text) ---
+        d.setTextColor(kColorBodyText, kColorBodyBg);
         const int startY = 32;
         const int lineH  = 22;
-        int visibleRows = (d.height() - 10 - startY) / lineH;
+        int visibleRows = (d.height() - kFooterH - startY) / lineH;
         if (visibleRows < 1) visibleRows = 1;
         if (items.size() >= 4) {
             items[3].label = hasUnreadConversations() ? "Conversations *" : "Conversations";
@@ -667,10 +760,10 @@ public:
 
         // --- Bottom hint bar (small text again) ---
         d.setTextSize(1);
-        d.setTextColor(WHITE, BLACK);
+        drawFooterBackground();
+        d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
-        d.fillRect(0, h - 10, d.width(), 10, BLACK);
-        d.setCursor(4, h - 9);
+        d.setCursor(4, h - kFooterH + 1);
         d.print("Arrows/W,S: move  Enter/Right: select  Backspace/Left: back");
     }
 
@@ -711,11 +804,13 @@ public:
 
     void draw() override {
         auto& d = M5Cardputer.Display;
-        d.fillScreen(BLACK);
-        d.setTextColor(WHITE, BLACK);
+        d.fillScreen(kColorBodyBg);
+        const int headerH = 24;
+        drawHeaderBackground(headerH);
 
         // --- Compact header: status only in two small lines ---
         d.setTextSize(1);
+        d.setTextColor(kColorHeaderText, kColorHeaderBg);
         d.setCursor(4, 4);
         d.print("Status: ");
         switch (gMesh.status()) {
@@ -750,11 +845,12 @@ public:
         }
 
         // --- List: Scan + devices ---
+        d.setTextColor(kColorBodyText, kColorBodyBg);
         d.setTextSize(2);
         const int startY = 28;   // move up to use the freed space
         const int lineH  = 22;
         int screenH = d.height();
-        int visibleRows = (screenH - 10 - startY) / lineH;
+        int visibleRows = (screenH - kFooterH - startY) / lineH;
         if (visibleRows < 1) visibleRows = 1;
 
         int itemCount = getItemCount();
@@ -789,10 +885,10 @@ public:
 
         // --- Bottom help bar ---
         d.setTextSize(1);
-        d.setTextColor(WHITE, BLACK);
+        drawFooterBackground();
+        d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
-        d.fillRect(0, h - 10, d.width(), 10, BLACK);
-        d.setCursor(4, h - 9);
+        d.setCursor(4, h - kFooterH + 1);
         d.print("Enter/Right: scan/connect   Backspace/Left: back");
     }
 
@@ -838,8 +934,10 @@ public:
 
     void draw() override {
         auto& d = M5Cardputer.Display;
-        d.fillScreen(BLACK);
-        d.setTextColor(WHITE, BLACK);
+        d.fillScreen(kColorBodyBg);
+        const int headerH = 44;
+        drawHeaderBackground(headerH);
+        d.setTextColor(kColorHeaderText, kColorHeaderBg);
 
         rebuildList();
 
@@ -907,7 +1005,7 @@ public:
         const int startY = 46;
         const int lineH  = 18;
         int screenH = d.height();
-        int visibleRows = (screenH - 10 - startY) / lineH;
+        int visibleRows = (screenH - kFooterH - startY) / lineH;
         if (visibleRows < 1) visibleRows = 1;
         menu.ensureVisible((int)nodeIndexMap.size(), visibleRows);
         int top = menu.topIndex();
@@ -939,9 +1037,10 @@ public:
 
         // Bottom hint
         d.setTextSize(1);
+        drawFooterBackground();
+        d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
-        d.fillRect(0, h - 10, d.width(), 10, BLACK);
-        d.setCursor(4, h - 9);
+        d.setCursor(4, h - kFooterH + 1);
         d.print("Backspace/Left: back   Shift: page");
     }
 
@@ -1000,10 +1099,12 @@ public:
 
     void draw() override {
         auto& d = M5Cardputer.Display;
-        d.fillScreen(BLACK);
-        d.setTextColor(WHITE, BLACK);
+        d.fillScreen(kColorBodyBg);
+        const int headerH = 24;
+        drawHeaderBackground(headerH);
 
         d.setTextSize(1);
+        d.setTextColor(kColorHeaderText, kColorHeaderBg);
         d.setCursor(4, 4);
         d.println("Channels");
         d.setCursor(4, 14);
@@ -1011,6 +1112,7 @@ public:
         d.println(connectionStatusLabel());
 
         int count = gMesh.getChannelCount();
+        d.setTextColor(kColorBodyText, kColorBodyBg);
         if (count == 0) {
             d.setCursor(4, 26);
             d.println("No channels yet");
@@ -1019,7 +1121,7 @@ public:
         const int startY = 32;
         const int lineH  = 22;
         int screenH = d.height();
-        int visibleRows = (screenH - 10 - startY) / lineH;
+        int visibleRows = (screenH - kFooterH - startY) / lineH;
         if (visibleRows < 1) visibleRows = 1;
 
         menu.ensureVisible(count, visibleRows);
@@ -1049,9 +1151,10 @@ public:
         }
 
         d.setTextSize(1);
+        drawFooterBackground();
+        d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
-        d.fillRect(0, h - 10, d.width(), 10, BLACK);
-        d.setCursor(4, h - 9);
+        d.setCursor(4, h - kFooterH + 1);
         d.print("Enter/Right: open  Backspace/Left: back  Shift: page");
     }
 
@@ -1115,8 +1218,10 @@ public:
 
     void draw() override {
         auto& d = M5Cardputer.Display;
-        d.fillScreen(BLACK);
-        d.setTextColor(WHITE, BLACK);
+        d.fillScreen(kColorBodyBg);
+        const int headerH = 34;
+        drawHeaderBackground(headerH);
+        d.setTextColor(kColorHeaderText, kColorHeaderBg);
 
         MeshNodeInfo node;
         bool hasNode = getSelectedNodeInfo(node);
@@ -1140,16 +1245,18 @@ public:
         const int startY = 36;
         const int lineH  = 22;
         int screenH = d.height();
-        int visibleRows = (screenH - 10 - startY) / lineH;
+        int visibleRows = (screenH - kFooterH - startY) / lineH;
         if (visibleRows < 1) visibleRows = 1;
 
         d.setTextSize(2);
+        d.setTextColor(kColorBodyText, kColorBodyBg);
         menu.drawMenu(d, items, startY, lineH, visibleRows);
 
         d.setTextSize(1);
+        drawFooterBackground();
+        d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
-        d.fillRect(0, h - 10, d.width(), 10, BLACK);
-        d.setCursor(4, h - 9);
+        d.setCursor(4, h - kFooterH + 1);
         d.print("Enter/Right: select  Backspace/Left: back");
     }
 
@@ -1195,16 +1302,19 @@ public:
 
     void draw() override {
         auto& d = M5Cardputer.Display;
-        d.fillScreen(BLACK);
-        d.setTextColor(WHITE, BLACK);
+        d.fillScreen(kColorBodyBg);
+        const int headerH = 24;
+        drawHeaderBackground(headerH);
 
         MeshNodeInfo node;
         bool hasNode = getSelectedNodeInfo(node);
 
         d.setTextSize(1);
+        d.setTextColor(kColorHeaderText, kColorHeaderBg);
         d.setCursor(4, 4);
         d.println("Node Info");
 
+        d.setTextColor(kColorBodyText, kColorBodyBg);
         if (!hasNode) {
             d.setCursor(4, 14);
             d.println("No node selected");
@@ -1273,9 +1383,10 @@ public:
         }
 
         d.setTextSize(1);
+        drawFooterBackground();
+        d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
-        d.fillRect(0, h - 10, d.width(), 10, BLACK);
-        d.setCursor(4, h - 9);
+        d.setCursor(4, h - kFooterH + 1);
         d.print("Backspace/Left: back");
     }
 };
@@ -1286,47 +1397,106 @@ class ConversationsScreen : public Screen {
 public:
     void onEnter() override {
         menu.reset();
-        rebuildList();
+        rebuildOrder();
     }
 
     void handleNav(NavKey k) override {
-        menu.handleNav(k, (int)items.size());
+        if (!isRadioReady()) return;
+        menu.handleNav(k, (int)convIndexMap.size());
         (void)k;
     }
 
     void draw() override {
         auto& d = M5Cardputer.Display;
-        d.fillScreen(BLACK);
-        d.setTextColor(WHITE, BLACK);
+        d.fillScreen(kColorBodyBg);
+        const int headerH = 24;
+        drawHeaderBackground(headerH);
 
-        rebuildList();
+        if (!isRadioReady()) {
+            d.setTextSize(1);
+            d.setTextColor(kColorHeaderText, kColorHeaderBg);
+            d.setCursor(4, 4);
+            d.println("Conversations");
+            d.setCursor(4, 14);
+            d.print("BLE: ");
+            d.println(connectionStatusLabel());
+            d.setTextColor(kColorBodyText, kColorBodyBg);
+            d.setCursor(4, 28);
+            d.println("Connect to a node to load conversations");
+
+            drawFooterBackground();
+            d.setTextColor(kColorFooterText, kColorFooterBg);
+            int h = d.height();
+            d.setCursor(4, h - kFooterH + 1);
+            d.print("Backspace/Left: back");
+            return;
+        }
+
+        rebuildOrder();
 
         d.setTextSize(1);
+        d.setTextColor(kColorHeaderText, kColorHeaderBg);
         d.setCursor(4, 4);
         d.println("Conversations");
         d.setCursor(4, 14);
         d.print("BLE: ");
         d.println(connectionStatusLabel());
 
+        if (convIndexMap.empty()) {
+            d.setTextColor(kColorBodyText, kColorBodyBg);
+            d.setCursor(4, 28);
+            d.println("No conversations yet");
+
+            drawFooterBackground();
+            d.setTextColor(kColorFooterText, kColorFooterBg);
+            int h = d.height();
+            d.setCursor(4, h - kFooterH + 1);
+            d.print("Backspace/Left: back");
+            return;
+        }
+
         const int startY = 28;
         const int lineH  = 22;
         int screenH = d.height();
-        int visibleRows = (screenH - 10 - 10 - startY) / lineH;
+        int visibleRows = (screenH - kFooterH - 10 - startY) / lineH;
         if (visibleRows < 1) visibleRows = 1;
 
         d.setTextSize(2);
+        d.setTextColor(kColorBodyText, kColorBodyBg);
+        int charWidth = d.textWidth("A");
+        if (charWidth <= 0) charWidth = 12;
+        int maxChars = (d.width() - 12) / charWidth;
+        if (maxChars < 6) maxChars = 6;
+
+        items.clear();
+        for (int idx : convIndexMap) {
+            Conversation* conv = getConversation(idx);
+            if (!conv) continue;
+            String label = conversationListTitle(*conv);
+            if (conv->hasUnread) {
+                label += " *";
+            }
+            String preview = lastMessagePreview(*conv);
+            if (preview.length() > 0) {
+                label += ": " + preview;
+            }
+            items.push_back({truncateLabel(label, (size_t)maxChars), true});
+        }
+
         menu.drawMenu(d, items, startY, lineH, visibleRows);
 
         // Hint below the list
         d.setTextSize(1);
+        d.setTextColor(kColorBodyText, kColorBodyBg);
         int hintY = startY + lineH * ((int)items.size() < visibleRows ? (int)items.size() : visibleRows) + 2;
         d.setCursor(4, hintY);
         d.println("Enter/Right: open chat");
 
         // Bottom hint
+        drawFooterBackground();
+        d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
-        d.fillRect(0, h - 10, d.width(), 10, BLACK);
-        d.setCursor(4, h - 9);
+        d.setCursor(4, h - kFooterH + 1);
         d.print("Arrows/W,S: move  Enter/Right: open  Backspace/Left: back");
     }
 
@@ -1341,53 +1511,34 @@ private:
     std::vector<MenuOption> items;
     std::vector<int>        convIndexMap;
 
-    void rebuildList() {
-        items.clear();
+    bool isRadioReady() const {
+        return gMesh.myNodeNum() != 0;
+    }
+
+    void rebuildOrder() {
         convIndexMap.clear();
-
-        std::vector<int> ordered;
-        int broadcastIdx = ensureConversation(kBroadcastAddr, true, 0);
-        ordered.push_back(broadcastIdx);
-
-        uint32_t myNode = gMesh.myNodeNum();
-        int nodeCount = gMesh.getNodeCount();
-        for (int i = 0; i < nodeCount; ++i) {
-            MeshNodeInfo info = gMesh.getNodeInfo(i);
-            if (info.num == 0 || info.num == myNode) continue;
-            int convIdx = ensureConversation(info.num, false, 0);
-            bool exists = false;
-            for (int idx : ordered) {
-                if (idx == convIdx) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) ordered.push_back(convIdx);
-        }
-
         for (int i = 0; i < (int)gConversations.size(); ++i) {
-            bool exists = false;
-            for (int idx : ordered) {
-                if (idx == i) {
-                    exists = true;
-                    break;
-                }
+            Conversation* conv = getConversation(i);
+            if (!conv || conv->messages.empty()) {
+                continue;
             }
-            if (!exists) ordered.push_back(i);
+            convIndexMap.push_back(i);
         }
 
-        for (int idx : ordered) {
-            Conversation* conv = getConversation(idx);
-            if (!conv) continue;
-            String label = conversationTitle(*conv);
-            if (conv->hasUnread) {
-                label += " *";
+        std::sort(convIndexMap.begin(), convIndexMap.end(), [](int a, int b) {
+            const Conversation* ca = getConversation(a);
+            const Conversation* cb = getConversation(b);
+            if (!ca || !cb) return a < b;
+            if (ca->hasUnread != cb->hasUnread) return ca->hasUnread > cb->hasUnread;
+            if (ca->lastActivitySeq != cb->lastActivitySeq) {
+                return ca->lastActivitySeq > cb->lastActivitySeq;
             }
-            items.push_back({label, true});
-            convIndexMap.push_back(idx);
-        }
+            String ta = conversationListTitle(*ca);
+            String tb = conversationListTitle(*cb);
+            return ta < tb;
+        });
 
-        if (menu.current() >= (int)items.size()) {
+        if (menu.current() >= (int)convIndexMap.size()) {
             menu.reset();
         }
     }
@@ -1507,8 +1658,7 @@ public:
 
     void draw() override {
         auto& d = M5Cardputer.Display;
-        d.fillScreen(BLACK);
-        d.setTextColor(WHITE, BLACK);
+        d.fillScreen(kColorBodyBg);
 
         int w = d.width();
         int h = d.height();
@@ -1522,6 +1672,8 @@ public:
 
         // Header
         d.setTextSize(1);
+        drawHeaderBackground(headerH);
+        d.setTextColor(kColorHeaderText, kColorHeaderBg);
         d.setCursor(4, 4);
         Conversation* conv = getConversation(gActiveConversation);
         if (!conv) {
@@ -1564,6 +1716,7 @@ public:
 
         // Draw messages
         d.setTextSize(1);
+        d.setTextColor(kColorBodyText, kColorBodyBg);
         int y = topY;
         for (int i = start; i < end; ++i) {
             const Message& msg = conv->messages[i];
@@ -1583,7 +1736,9 @@ public:
         }
 
         // Input line at bottom: show the buffer
-        d.fillRect(0, h - inputH, w, inputH, BLACK);
+        d.fillRect(0, h - inputH, w, inputH, kColorFooterBg);
+        d.drawFastHLine(0, h - inputH, w, kColorSeparator);
+        d.setTextColor(kColorFooterText, kColorFooterBg);
         d.setCursor(2, h - inputH + 1);
         d.print("> ");
         d.print(inputBuffer);

@@ -4,3 +4,4 @@
 .vscode/launch.json
 .vscode/ipch
 lib/_upstream/
+platformio.local.ini

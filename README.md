@@ -44,4 +44,4 @@ Navigation (Cardputer keyboard):
 If a microSD card is present, Cardtastic stores conversations as JSON under `/cardtastic/` on the card. The app keeps the most recent 50 messages per conversation. If no card is available, conversations live in RAM only.
 
 ## License
-This project is intended to be released under the GPLv3.
+This project is licensed under the GPLv3.
