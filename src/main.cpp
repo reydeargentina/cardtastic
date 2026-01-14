@@ -143,6 +143,7 @@ static bool gStorageLoaded = false;
 static uint32_t gLoadedRadioNode = 0;
 static uint32_t gLastInputMs = 0;
 static bool gScreenSleeping = false;
+static int gPendingPinDeviceIndex = -1;
 
 Conversation* getConversation(int index);
 int ensureConversation(uint32_t peer, bool isBroadcast, uint8_t channel);
@@ -678,8 +679,9 @@ struct ListMenuState {
                   const std::vector<MenuOption>& items,
                   int startY,
                   int lineH,
-                  int maxRows = -1) {
-        d.setTextSize(2);
+                  int maxRows = -1,
+                  int textSize = 2) {
+        d.setTextSize(textSize);
         int visibleRows = maxRows;
         if (visibleRows <= 0) {
             visibleRows = (d.height() - startY) / lineH;
@@ -730,6 +732,7 @@ public:
 enum class ScreenId {
     HOME,
     CONNECT,
+    PIN_ENTRY,
     NODES,
     CHANNELS,
     NODE_ACTIONS,
@@ -741,6 +744,7 @@ enum class ScreenId {
 // Forward declarations
 class HomeScreen;
 class ConnectScreen;
+class PinEntryScreen;
 class NodesScreen;
 class ChannelsScreen;
 class NodeActionsScreen;
@@ -769,6 +773,7 @@ private:
     // Static screen instances (simple for now)
     HomeScreen*          home;
     ConnectScreen*       connect;
+    PinEntryScreen*      pinEntry;
     NodesScreen*         nodes;
     ChannelsScreen*      channels;
     NodeActionsScreen*   nodeActions;
@@ -998,7 +1003,109 @@ private:
         } else {
             int devIndex = sel - 1;
             drawHeaderRightStatus("Connecting", "");
+            gMesh.clearPasskey();
             gMesh.connectToIndex(devIndex);
+        }
+    }
+};
+
+// -------------------- PIN entry screen --------------------
+
+class PinEntryScreen : public Screen {
+public:
+    void onEnter() override {
+        pinBuffer = "";
+    }
+
+    void onExit() override {
+        pinBuffer = "";
+        gPendingPinDeviceIndex = -1;
+    }
+
+    void handleNav(NavKey k) override {
+        if (k == NavKey::ENTER) {
+            attemptConnect();
+        }
+    }
+
+    void handleChars(const std::vector<char>& chars) override {
+        for (char c : chars) {
+            if (c == '\b') {
+                if (pinBuffer.length() > 0) {
+                    pinBuffer.remove(pinBuffer.length() - 1);
+                }
+            } else if (c >= '0' && c <= '9') {
+                if (pinBuffer.length() < 6) {
+                    pinBuffer += c;
+                }
+            }
+        }
+    }
+
+    void draw() override {
+        auto& d = M5Cardputer.Display;
+        d.fillScreen(kColorBodyBg);
+        const int headerH = 24;
+        drawHeaderBackground(headerH);
+
+        d.setTextSize(1);
+        d.setTextColor(kColorHeaderText, kColorHeaderBg);
+        d.setCursor(4, 4);
+        d.println("Enter BLE PIN");
+        d.setCursor(4, 14);
+        d.print("Device: ");
+        d.println(pendingDeviceLabel());
+
+        int y = headerH + 4;
+        d.setTextColor(kColorBodyText, kColorBodyBg);
+        if (gMesh.status() == ConnectionStatus::ERROR && gMesh.lastError().length() > 0) {
+            d.setCursor(4, y);
+            d.print("Error: ");
+            d.println(gMesh.lastError());
+            y += 12;
+        }
+
+        d.setTextSize(2);
+        String pinDisplay = pinBuffer;
+        for (size_t i = pinDisplay.length(); i < 6; ++i) {
+            pinDisplay += "-";
+        }
+        String line = String("PIN: ") + pinDisplay;
+        int x = (d.width() - d.textWidth(line)) / 2;
+        if (x < 0) x = 0;
+        d.setCursor(x, y + 12);
+        d.println(line);
+
+        d.setTextSize(1);
+        drawFooterBackground();
+        d.setTextColor(kColorFooterText, kColorFooterBg);
+        int h = d.height();
+        d.setCursor(4, h - kFooterH + 1);
+        d.print("Enter: connect  Backspace: delete  FN+Backspace: back");
+    }
+
+private:
+    String pinBuffer;
+
+    String pendingDeviceLabel() const {
+        if (gPendingPinDeviceIndex < 0 || gPendingPinDeviceIndex >= gMesh.getDeviceCount()) {
+            return String("Unknown");
+        }
+        MeshDeviceInfo info = gMesh.getDeviceInfo(gPendingPinDeviceIndex);
+        if (info.name.length() > 0) return info.name;
+        if (info.id.length() > 0) return info.id;
+        return String("Unknown");
+    }
+
+    void attemptConnect() {
+        if (pinBuffer.length() == 0) {
+            return;
+        }
+        uint32_t pin = (uint32_t)pinBuffer.toInt();
+        drawHeaderRightStatus("Connecting", "");
+        bool ok = gMesh.submitPasskey(pin);
+        if (ok) {
+            gScreens.switchTo(ScreenId::CONNECT);
         }
     }
 };
@@ -1310,6 +1417,8 @@ public:
 
         MeshNodeInfo node;
         bool hasNode = getSelectedNodeInfo(node);
+        bool isSelf = hasNode && node.num == gMesh.myNodeNum();
+        items[0].enabled = !isSelf;
 
         d.setTextSize(1);
         d.setCursor(4, 4);
@@ -1359,6 +1468,9 @@ private:
         }
 
         if (sel == 0) {
+            if (node.num == gMesh.myNodeNum()) {
+                return;
+            }
             int convIndex = ensureConversation(node.num, false, 0);
             gActiveConversation = convIndex;
             Conversation* conv = getConversation(convIndex);
@@ -1509,6 +1621,7 @@ public:
             d.setCursor(4, 28);
             d.println("Connect to a node to load conversations");
 
+            d.setTextSize(1);
             drawFooterBackground();
             d.setTextColor(kColorFooterText, kColorFooterBg);
             int h = d.height();
@@ -1532,6 +1645,7 @@ public:
             d.setCursor(4, 28);
             d.println("No conversations yet");
 
+            d.setTextSize(1);
             drawFooterBackground();
             d.setTextColor(kColorFooterText, kColorFooterBg);
             int h = d.height();
@@ -1541,12 +1655,11 @@ public:
         }
 
         const int startY = 28;
-        const int lineH  = 22;
+        const int lineH  = 16;
         int screenH = d.height();
         int visibleRows = (screenH - kFooterH - 10 - startY) / lineH;
         if (visibleRows < 1) visibleRows = 1;
 
-        d.setTextSize(2);
         d.setTextColor(kColorBodyText, kColorBodyBg);
         int charWidth = d.textWidth("A");
         if (charWidth <= 0) charWidth = 12;
@@ -1568,16 +1681,10 @@ public:
             items.push_back({truncateLabel(label, (size_t)maxChars), true});
         }
 
-        menu.drawMenu(d, items, startY, lineH, visibleRows);
-
-        // Hint below the list
-        d.setTextSize(1);
-        d.setTextColor(kColorBodyText, kColorBodyBg);
-        int hintY = startY + lineH * ((int)items.size() < visibleRows ? (int)items.size() : visibleRows) + 2;
-        d.setCursor(4, hintY);
-        d.println("Enter/Right: open chat");
+        menu.drawMenu(d, items, startY, lineH, visibleRows, 1);
 
         // Bottom hint
+        d.setTextSize(1);
         drawFooterBackground();
         d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
@@ -1605,6 +1712,9 @@ private:
         for (int i = 0; i < (int)gConversations.size(); ++i) {
             Conversation* conv = getConversation(i);
             if (!conv || conv->messages.empty()) {
+                continue;
+            }
+            if (!conv->isBroadcast && conv->peer == gMesh.myNodeNum()) {
                 continue;
             }
             convIndexMap.push_back(i);
@@ -1653,7 +1763,7 @@ public:
         int h = d.height();
 
         // Layout: small header at top, messages in the middle, input at bottom
-        const int headerH = 30;   // three small lines
+        const int headerH = 20;   // two small lines
         const int inputH  = 12;   // one input line
         const int topY    = headerH + 4;
         const int bottomY = h - inputH - 2;
@@ -1749,7 +1859,7 @@ public:
         int h = d.height();
 
         // Layout: small header, messages, input at bottom
-        const int headerH = 30;
+        const int headerH = 20;
         const int inputH  = 12;
         const int topY    = headerH + 4;
         const int bottomY = h - inputH - 2;
@@ -1766,13 +1876,9 @@ public:
             d.setCursor(4, 14);
             d.println("No conversation selected");
         } else {
-            d.print("Chat: ");
             d.println(conversationTitle(*conv));
             d.setCursor(4, 14);
-            d.print("BLE: ");
-            d.println(connectionStatusLabel());
-            d.setCursor(4, 24);
-            d.println("FN+;/. scroll  Shift=page");
+            d.println("FN + ;/. SCROLL  | DEL BACK");
         }
 
         int maxRows = (bottomY - topY) / lineH;
@@ -1829,6 +1935,10 @@ public:
         d.print(inputBuffer);
     }
 
+    bool isInputEmpty() const {
+        return inputBuffer.length() == 0;
+    }
+
 private:
     String inputBuffer;
 };
@@ -1838,6 +1948,7 @@ private:
 void ScreenManager::begin() {
     home    = new HomeScreen();
     connect = new ConnectScreen();
+    pinEntry = new PinEntryScreen();
     nodes   = new NodesScreen();
     channels = new ChannelsScreen();
     nodeActions = new NodeActionsScreen();
@@ -1857,6 +1968,7 @@ Screen* ScreenManager::getScreenById(ScreenId id) {
     switch (id) {
     case ScreenId::HOME:          return home;
     case ScreenId::CONNECT:       return connect;
+    case ScreenId::PIN_ENTRY:     return pinEntry;
     case ScreenId::NODES:         return nodes;
     case ScreenId::CHANNELS:      return channels;
     case ScreenId::NODE_ACTIONS:  return nodeActions;
@@ -1881,7 +1993,14 @@ void ScreenManager::handleNav(NavKey k) {
 
     // Global "back": go to Home from any screen except Home
     if (k == NavKey::ESC) {
-        if (currentId == ScreenId::NODE_INFO) {
+        if (currentId == ScreenId::PIN_ENTRY) {
+            gMesh.disconnect();
+            switchTo(ScreenId::CONNECT);
+            return;
+        } else if (currentId == ScreenId::CHAT) {
+            switchTo(ScreenId::CONVERSATIONS);
+            return;
+        } else if (currentId == ScreenId::NODE_INFO) {
             switchTo(ScreenId::NODE_ACTIONS);
             return;
         } else if (currentId == ScreenId::NODE_ACTIONS) {
@@ -1973,6 +2092,12 @@ void ScreenManager::loop() {
         return;
     }
 
+    if (currentId != ScreenId::PIN_ENTRY && gMesh.awaitingPasskey()) {
+        gPendingPinDeviceIndex = gMesh.connectedDeviceIndex();
+        switchTo(ScreenId::PIN_ENTRY);
+        return;
+    }
+
     if (tryLoadConversationsOnce()) {
         needRedraw = true;
     }
@@ -1999,44 +2124,50 @@ void ScreenManager::loop() {
         Keyboard_Class::KeysState st = M5Cardputer.Keyboard.keysState();
 
         bool isChat = (currentId == ScreenId::CHAT);
+        bool isPin  = (currentId == ScreenId::PIN_ENTRY);
 
-        if (isChat) {
-            // --- CHAT MODE ---
+        if (isChat || isPin) {
+            // --- TEXT INPUT MODE ---
             if (st.enter) {
-                nk = NavKey::ENTER;   // send message
+                nk = NavKey::ENTER;
             }
             else if (st.del) {
-                // Backspace: with FN = exit, without FN = delete text
+                // Backspace: with FN = back, without FN = delete text
                 if (st.fn) {
-                    nk = NavKey::ESC;     // go back to Home
+                    nk = NavKey::ESC;
                 } else {
-                    textChars.push_back('\b'); // backspace in the input
+                    if (isChat) {
+                        auto* chatScreen = static_cast<ChatScreen*>(currentScreen);
+                        if (chatScreen && chatScreen->isInputEmpty()) {
+                            nk = NavKey::ESC;
+                        } else {
+                            textChars.push_back('\b');
+                        }
+                    } else {
+                        textChars.push_back('\b');
+                    }
                 }
             }
             else {
-                // In chat:
-                // - With FN held: use ; . , / as arrows (do not insert text)
-                // - Without FN: everything is text (including ; . , /, w, s, etc.)
-
-                if (st.fn) {
-                    // FN + key => navigation
+                if (st.fn && isChat) {
+                    // Chat only: FN + key => navigation
                     bool fast = st.shift;
                     for (auto c : st.word) {
                         switch (c) {
-                        case ';':   // key with UP arrow
-                        case ':':   // shift + ;
+                        case ';':
+                        case ':':
                             nk = fast ? NavKey::UP_FAST : NavKey::UP;
                             break;
-                        case '.':   // key with DOWN arrow
-                        case '>':   // shift + .
+                        case '.':
+                        case '>':
                             nk = fast ? NavKey::DOWN_FAST : NavKey::DOWN;
                             break;
-                        case ',':   // key with LEFT arrow => back
-                        case '<':   // shift + ,
+                        case ',':
+                        case '<':
                             nk = NavKey::ESC;
                             break;
-                        case '/':   // key with RIGHT arrow => navigation enter
-                        case '?':   // shift + /
+                        case '/':
+                        case '?':
                             nk = NavKey::ENTER;
                             break;
                         default:
@@ -2046,8 +2177,22 @@ void ScreenManager::loop() {
                             break;
                         }
                     }
+                } else if (isPin) {
+                    // PIN entry: digits only, allow left/right shortcuts
+                    for (auto c : st.word) {
+                        if (c >= '0' && c <= '9') {
+                            textChars.push_back(c);
+                        } else if (c == ',' || c == '<') {
+                            nk = NavKey::ESC;
+                        } else if (c == '/' || c == '?') {
+                            nk = NavKey::ENTER;
+                        }
+                        if (nk != NavKey::NONE) {
+                            break;
+                        }
+                    }
                 } else {
-                    // Without FN: all characters are text
+                    // Chat without FN: all characters are text
                     for (auto c : st.word) {
                         textChars.push_back(c);
                     }
