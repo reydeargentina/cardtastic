@@ -29,6 +29,14 @@ Serial monitor:
 pio device monitor -e m5stack-cardputer
 ```
 
+## Local PlatformIO Overrides
+For local port settings, create `platformio.local.ini` (ignored by git) and override the ports there:
+```ini
+[env:m5stack-cardputer]
+upload_port = /dev/serial/by-id/usb-...
+monitor_port = /dev/serial/by-id/usb-...
+```
+
 ## Usage
 - Connect: use Scan to find radios, then connect.
 - Conversations: open recent chats; unread messages show a `*`.
