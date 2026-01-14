@@ -7,15 +7,21 @@
 extern MeshtasticClient gMesh;
 
 namespace {
-constexpr uint32_t kDefaultBlePasskey = 123456;
-uint32_t gBlePasskey = kDefaultBlePasskey;
 constexpr int kScanAttempts = 3;
 constexpr int kScanSeconds = 8;
 
 class MeshClientCallbacks : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* pClient) override {
+        gMesh.handleConnect(pClient);
+    }
+
+    void onConnectFail(NimBLEClient* pClient, int reason) override {
+        gMesh.handleConnectFail(pClient, reason);
+    }
+
     void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
-        Serial.println("[Mesh] Passkey requested, injecting");
-        NimBLEDevice::injectPassKey(connInfo, gBlePasskey);
+        Serial.println("[Mesh] Passkey requested");
+        gMesh.handlePasskeyRequest(connInfo);
     }
 
     void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
@@ -23,6 +29,7 @@ class MeshClientCallbacks : public NimBLEClientCallbacks {
                       connInfo.isEncrypted() ? 1 : 0,
                       connInfo.isAuthenticated() ? 1 : 0,
                       connInfo.isBonded() ? 1 : 0);
+        gMesh.handleAuthComplete(connInfo);
     }
 
     void onDisconnect(NimBLEClient* pClient, int reason) override {
@@ -42,6 +49,13 @@ MeshtasticClient::MeshtasticClient()
     : _status(ConnectionStatus::DISCONNECTED),
       _radioName(""),
       _lastError(""),
+      _authFailed(false),
+      _awaitingPasskey(false),
+      _autoPasskeyEnabled(false),
+      _autoPasskey(0),
+      _pendingPasskeyHandle(0xFFFF),
+      _needsServiceDiscovery(false),
+      _pendingConnectIndex(-1),
       _scanning(false),
       _connectedIndex(-1),
       _myNodeNum(0),
@@ -72,6 +86,13 @@ void MeshtasticClient::begin() {
     _status         = ConnectionStatus::DISCONNECTED;
     _radioName      = "";
     _lastError      = "";
+    _authFailed     = false;
+    _awaitingPasskey = false;
+    _autoPasskeyEnabled = false;
+    _autoPasskey = 0;
+    _pendingPasskeyHandle = 0xFFFF;
+    _needsServiceDiscovery = false;
+    _pendingConnectIndex = -1;
     _scanning       = false;
     _connectedIndex = -1;
     _myNodeNum      = 0;
@@ -85,6 +106,7 @@ void MeshtasticClient::begin() {
     _devices.clear();
     _nodes.clear();
     _channels.clear();
+    _knownDevices.clear();
     _scanProgressCb = nullptr;
 
     _client         = nullptr;
@@ -97,6 +119,32 @@ void MeshtasticClient::begin() {
 
 void MeshtasticClient::loop() {
     if (!_client || !_client->isConnected()) return;
+
+    if (_awaitingPasskey) {
+        return;
+    }
+
+    if (_needsServiceDiscovery) {
+        NimBLEConnInfo info = _client->getConnInfo();
+        if (!info.isEncrypted()) {
+            return;
+        }
+        _needsServiceDiscovery = false;
+
+        // Debug: dump all services
+        debugDumpServices();
+
+        // Discover and subscribe to MeshBluetoothService
+        if (!discoverMeshtasticService()) {
+            Serial.println("[Mesh] discoverMeshtasticService() failed after connect");
+            // discoverMeshtasticService sets ERROR if something fails
+            return;
+        }
+
+        if (!requestConfig()) {
+            Serial.println("[Mesh] Failed to request config");
+        }
+    }
 
     uint32_t now = millis();
     uint32_t pollIntervalMs = (_configRequested && !_configComplete) ? 50 : 1000;
@@ -167,6 +215,7 @@ void MeshtasticClient::startScan() {
         int count = results.getCount();
         Serial.printf("[Mesh] Scan done, results=%d\n", count);
 
+        constexpr uint16_t kAdvTypeIncompleteName = 0x08;
         for (int i = 0; i < count; ++i) {
             const NimBLEAdvertisedDevice* dev = results.getDevice(i);
             if (!dev) continue;
@@ -182,31 +231,55 @@ void MeshtasticClient::startScan() {
                 continue;
             }
 
-            if (name.empty()) {
-                name = addr;
+            String addrStr = String(addr.c_str());
+            String nameStr = String(name.c_str());
+            if (nameStr.length() == 0) {
+                std::string shortName = dev->getPayloadByType(kAdvTypeIncompleteName);
+                if (!shortName.empty()) {
+                    nameStr = String(shortName.c_str());
+                }
+            }
+            if (nameStr.length() == 0) {
+                String known = lookupKnownDeviceName(addrStr);
+                if (known.length() > 0) {
+                    nameStr = known;
+                }
+            }
+            if (nameStr.length() == 0) {
+                nameStr = addrStr;
+            }
+            if (nameStr != addrStr) {
+                updateKnownDeviceName(addrStr, nameStr);
             }
 
             bool exists = false;
             for (auto& existing : _devices) {
-                if (existing.id == String(addr.c_str())) {
+                if (existing.id == addrStr) {
                     exists = true;
-                    if (existing.name == existing.id && name != addr) {
-                        existing.name = String(name.c_str());
+                    if (existing.name == existing.id && nameStr != addrStr) {
+                        existing.name = nameStr;
                     }
                     break;
                 }
             }
             if (!exists) {
                 MeshDeviceInfo info;
-                info.name = String(name.c_str());
-                info.id   = String(addr.c_str());
+                info.name = nameStr;
+                info.id   = addrStr;
                 _devices.push_back(info);
             }
         }
 
         pScan->clearResults();
         totalFound = (int)_devices.size();
-        if (totalFound > 0) break;
+        bool anyUnnamed = false;
+        for (const auto& dev : _devices) {
+            if (dev.name == dev.id) {
+                anyUnnamed = true;
+                break;
+            }
+        }
+        if (totalFound > 0 && !anyUnnamed) break;
         delay(150);
     }
 
@@ -301,6 +374,31 @@ MeshChannelInfo* MeshtasticClient::getOrCreateChannel(int8_t index) {
     return &_channels.back();
 }
 
+String MeshtasticClient::lookupKnownDeviceName(const String& id) const {
+    for (const auto& dev : _knownDevices) {
+        if (dev.id == id) {
+            return dev.name;
+        }
+    }
+    return String();
+}
+
+void MeshtasticClient::updateKnownDeviceName(const String& id, const String& name) {
+    if (name.length() == 0 || name == id) {
+        return;
+    }
+    for (auto& dev : _knownDevices) {
+        if (dev.id == id) {
+            dev.name = name;
+            return;
+        }
+    }
+    MeshDeviceInfo info;
+    info.id = id;
+    info.name = name;
+    _knownDevices.push_back(info);
+}
+
 void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _svc           = nullptr;
     _charToRadio   = nullptr;
@@ -320,6 +418,11 @@ void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _lastFromNum    = 0;
     _rxTextQueue.clear();
     _channels.clear();
+    _authFailed = false;
+    _awaitingPasskey = false;
+    _pendingPasskeyHandle = 0xFFFF;
+    _needsServiceDiscovery = false;
+    _pendingConnectIndex = -1;
     if (clearNodes) {
         _nodes.clear();
     }
@@ -411,12 +514,17 @@ bool MeshtasticClient::connectToIndex(int index) {
         _status    = ConnectionStatus::ERROR;
         return false;
     }
+    _authFailed = false;
 
     // Toggle: if already connected to this index, disconnect
     if (_status == ConnectionStatus::CONNECTED && _connectedIndex == index) {
         Serial.println("[Mesh] Already connected to this index, toggling -> disconnect");
         disconnect();
         return true;
+    }
+
+    if (_status == ConnectionStatus::CONNECTING && _client) {
+        _client->cancelConnect();
     }
 
     // If connected to another device, disconnect first
@@ -434,8 +542,9 @@ bool MeshtasticClient::connectToIndex(int index) {
 
     _status         = ConnectionStatus::CONNECTING;
     _lastError      = "";
-    _radioName      = info.name;
+    _radioName      = info.name.length() ? info.name : info.id;
     _connectedIndex = -1;
+    _pendingConnectIndex = index;
 
     // Create a client if needed
     if (_client == nullptr) {
@@ -448,54 +557,15 @@ bool MeshtasticClient::connectToIndex(int index) {
     std::string addrStr(info.id.c_str());
     NimBLEAddress addr(addrStr, BLE_ADDR_PUBLIC);
 
-    // Blocking connect for now (MVP)
-    bool ok = _client->connect(addr);
+    // Async connect to keep UI responsive during pairing
+    bool ok = _client->connect(addr, true, true);
     if (!ok) {
-        Serial.println("[Mesh] client->connect() returned false");
-
-        _status         = ConnectionStatus::ERROR;
-        _lastError      = "Connect failed";
-        _connectedIndex = -1;
+        Serial.println("[Mesh] client->connect(async) returned false");
+        _status               = ConnectionStatus::ERROR;
+        _lastError            = "Connect failed";
+        _connectedIndex       = -1;
+        _pendingConnectIndex  = -1;
         return false;
-    }
-
-    if (!_client->isConnected()) {
-        Serial.println("[Mesh] client reports not connected after connect()");
-        _status         = ConnectionStatus::ERROR;
-        _lastError      = "Not connected";
-        _connectedIndex = -1;
-        return false;
-    }
-
-    Serial.println("[Mesh] Connected OK");
-
-    _status         = ConnectionStatus::CONNECTED;
-    _connectedIndex = index;
-    _lastError      = "";
-
-    if (!_client->secureConnection()) {
-        Serial.println("[Mesh] secureConnection failed");
-    }
-
-    _rxTextQueue.clear();
-    _nodes.clear();
-    _channels.clear();
-    _needsPull = false;
-    _configRequested = false;
-    _configComplete = false;
-
-    // Debug: dump all services
-    debugDumpServices();
-
-    // Discover and subscribe to MeshBluetoothService
-    if (!discoverMeshtasticService()) {
-        Serial.println("[Mesh] discoverMeshtasticService() failed after connect");
-        // discoverMeshtasticService sets ERROR if something fails
-        return false;
-    }
-
-    if (!requestConfig()) {
-        Serial.println("[Mesh] Failed to request config");
     }
 
     return true;
@@ -555,9 +625,14 @@ void MeshtasticClient::debugDumpServices() {
 void MeshtasticClient::disconnect() {
     Serial.println("[Mesh] Disconnect requested");
 
-    if (_client && _client->isConnected()) {
-        Serial.println("[Mesh] Calling client->disconnect()");
-        _client->disconnect();
+    if (_client) {
+        if (_client->isConnected()) {
+            Serial.println("[Mesh] Calling client->disconnect()");
+            _client->disconnect();
+        } else if (_status == ConnectionStatus::CONNECTING) {
+            Serial.println("[Mesh] Cancelling pending connect");
+            _client->cancelConnect();
+        }
     }
 
     resetConnectionState(false);
@@ -567,6 +642,59 @@ void MeshtasticClient::disconnect() {
 void MeshtasticClient::handleDisconnect(int reason) {
     resetConnectionState(false);
     _lastError = String("Disconnected (") + reason + ")";
+}
+
+void MeshtasticClient::handleConnect(NimBLEClient* pClient) {
+    if (!pClient || !pClient->isConnected()) {
+        _status = ConnectionStatus::ERROR;
+        _lastError = "Connect failed";
+        _pendingConnectIndex = -1;
+        return;
+    }
+
+    Serial.println("[Mesh] Connected OK");
+    _status         = ConnectionStatus::CONNECTED;
+    _connectedIndex = _pendingConnectIndex;
+    _pendingConnectIndex = -1;
+    _lastError      = "";
+    _authFailed     = false;
+    _awaitingPasskey = false;
+    _pendingPasskeyHandle = 0xFFFF;
+    _needsServiceDiscovery = true;
+
+    if (!pClient->secureConnection(true)) {
+        Serial.println("[Mesh] secureConnection async failed");
+    }
+
+    _rxTextQueue.clear();
+    _nodes.clear();
+    _channels.clear();
+    _needsPull = false;
+    _configRequested = false;
+    _configComplete = false;
+}
+
+void MeshtasticClient::handleConnectFail(NimBLEClient* pClient, int reason) {
+    (void)pClient;
+    Serial.printf("[Mesh] Connect failed (reason=%d)\n", reason);
+    _status               = ConnectionStatus::ERROR;
+    _lastError            = String("Connect failed (") + reason + ")";
+    _connectedIndex       = -1;
+    _pendingConnectIndex  = -1;
+    _awaitingPasskey      = false;
+    _pendingPasskeyHandle = 0xFFFF;
+    _needsServiceDiscovery = false;
+}
+
+void MeshtasticClient::handleAuthComplete(const NimBLEConnInfo& connInfo) {
+    _awaitingPasskey = false;
+    if (!connInfo.isEncrypted()) {
+        _authFailed = true;
+        _status = ConnectionStatus::ERROR;
+        _lastError = "Auth failed";
+    } else {
+        _authFailed = false;
+    }
 }
 
 bool MeshtasticClient::popTextMessage(MeshTextMessage& out) {
@@ -676,7 +804,40 @@ bool MeshtasticClient::sendTextMessage(const String& text, uint32_t dest, uint8_
 }
 
 void MeshtasticClient::setPasskey(uint32_t passkey) {
-    gBlePasskey = passkey;
+    _autoPasskeyEnabled = true;
+    _autoPasskey = passkey;
+}
+
+void MeshtasticClient::clearPasskey() {
+    _autoPasskeyEnabled = false;
+    _autoPasskey = 0;
+}
+
+bool MeshtasticClient::submitPasskey(uint32_t passkey) {
+    if (_pendingPasskeyHandle == 0xFFFF) return false;
+    NimBLEClient* client = NimBLEDevice::getClientByHandle(_pendingPasskeyHandle);
+    if (!client || !client->isConnected()) {
+        _pendingPasskeyHandle = 0xFFFF;
+        _awaitingPasskey = false;
+        return false;
+    }
+    NimBLEConnInfo info = client->getConnInfo();
+    bool ok = NimBLEDevice::injectPassKey(info, passkey);
+    if (ok) {
+        _awaitingPasskey = false;
+        _pendingPasskeyHandle = 0xFFFF;
+    }
+    return ok;
+}
+
+void MeshtasticClient::handlePasskeyRequest(const NimBLEConnInfo& connInfo) {
+    if (_autoPasskeyEnabled) {
+        Serial.println("[Mesh] Auto passkey enabled, injecting");
+        NimBLEDevice::injectPassKey(connInfo, _autoPasskey);
+        return;
+    }
+    _awaitingPasskey = true;
+    _pendingPasskeyHandle = connInfo.getConnHandle();
 }
 
 // ---- Notifications ----

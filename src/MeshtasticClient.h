@@ -73,6 +73,8 @@ public:
     ConnectionStatus status()      const { return _status; }
     const String&    radioName()   const { return _radioName; }
     const String&    lastError()   const { return _lastError; }
+    bool             authFailed() const { return _authFailed; }
+    bool             awaitingPasskey() const { return _awaitingPasskey; }
     bool             isScanning()  const { return _scanning; }
     bool             isConnected() const { return _status == ConnectionStatus::CONNECTED; }
 
@@ -94,9 +96,13 @@ public:
 
     // ---- Connection / debug ----
     bool connectToIndex(int index);
+    int  connectedDeviceIndex() const { return _connectedIndex; }
     void debugDumpServices();
     void disconnect();
     void handleDisconnect(int reason);
+    void handleConnect(NimBLEClient* pClient);
+    void handleConnectFail(NimBLEClient* pClient, int reason);
+    void handleAuthComplete(const NimBLEConnInfo& connInfo);
 
     // ---- Incoming messages (text) ----
     bool     popTextMessage(MeshTextMessage& out);
@@ -107,6 +113,9 @@ public:
     bool requestConfig();
     bool sendTextMessage(const String& text, uint32_t dest = 0xFFFFFFFF, uint8_t channel = 0);
     void setPasskey(uint32_t passkey);
+    void clearPasskey();
+    bool submitPasskey(uint32_t passkey);
+    void handlePasskeyRequest(const NimBLEConnInfo& connInfo);
 
 private:
     // --- Internal helpers ---
@@ -115,6 +124,8 @@ private:
     MeshNodeInfo* getOrCreateNode(uint32_t num);
     MeshChannelInfo* getOrCreateChannel(int8_t index);
     void resetConnectionState(bool clearNodes);
+    String lookupKnownDeviceName(const String& id) const;
+    void updateKnownDeviceName(const String& id, const String& name);
     void handleFromNumNotify(NimBLERemoteCharacteristic* chr,
                              uint8_t* data, size_t len, bool isNotify);
     void handleLogNotify(NimBLERemoteCharacteristic* chr,
@@ -123,6 +134,13 @@ private:
     ConnectionStatus            _status;
     String                      _radioName;
     String                      _lastError;
+    bool                        _authFailed;
+    bool                        _awaitingPasskey;
+    bool                        _autoPasskeyEnabled;
+    uint32_t                    _autoPasskey;
+    uint16_t                    _pendingPasskeyHandle;
+    bool                        _needsServiceDiscovery;
+    int                         _pendingConnectIndex;
     bool                        _scanning;
     int                         _connectedIndex;
     uint32_t                    _myNodeNum;
@@ -134,6 +152,7 @@ private:
     uint32_t                    _lastFromNum;
     std::deque<MeshTextMessage> _rxTextQueue;
     std::vector<MeshDeviceInfo> _devices;
+    std::vector<MeshDeviceInfo> _knownDevices;
     std::vector<MeshNodeInfo>   _nodes;
     std::vector<MeshChannelInfo> _channels;
     NimBLEClient*               _client;
