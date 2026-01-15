@@ -126,7 +126,7 @@ struct Conversation {
     bool                 isBroadcast;
     uint8_t              channel;
     std::vector<Message> messages;
-    int                  firstVisibleIndex;  // -1 = auto-bottom
+    int                  firstVisibleIndex;  // -1 = auto-bottom (line index)
     bool                 hasUnread;
     uint32_t             lastActivitySeq;
 };
@@ -1775,7 +1775,9 @@ public:
         int maxRows = (bottomY - topY) / lineH;
         if (maxRows < 1) maxRows = 1;
 
-        int total    = (int)conv->messages.size();
+        std::vector<String> lines;
+        buildWrappedLines(*conv, d, lines);
+        int total    = (int)lines.size();
         int maxStart = (total > maxRows) ? (total - maxRows) : 0;
         int step     = (k == NavKey::UP_FAST || k == NavKey::DOWN_FAST) ? maxRows : 1;
 
@@ -1888,7 +1890,9 @@ public:
             return;
         }
 
-        int total    = (int)conv->messages.size();
+        std::vector<String> lines;
+        buildWrappedLines(*conv, d, lines);
+        int total    = (int)lines.size();
         int maxStart = (total > maxRows) ? (total - maxRows) : 0;
 
         if (conv->firstVisibleIndex < 0) {
@@ -1910,19 +1914,8 @@ public:
         d.setTextColor(kColorBodyText, kColorBodyBg);
         int y = topY;
         for (int i = start; i < end; ++i) {
-            const Message& msg = conv->messages[i];
             d.setCursor(2, y);
-
-            // Simple prefix
-            if (msg.fromMe) {
-                d.print("Me> ");
-            } else {
-                String label = gMesh.nodeLabel(msg.from);
-                d.print(label);
-                d.print("> ");
-            }
-            d.println(msg.text);
-
+            d.println(lines[i]);
             y += lineH;
         }
 
@@ -1940,6 +1933,145 @@ public:
     }
 
 private:
+    String truncateToWidth(const String& text, int maxWidth, M5GFX& d) const {
+        if (maxWidth <= 0) return String("");
+        if (d.textWidth(text) <= maxWidth) return text;
+        const String ellipsis = "...";
+        int ellipsisW = d.textWidth(ellipsis);
+        if (ellipsisW >= maxWidth) return text.substring(0, 1);
+        int len = (int)text.length();
+        while (len > 0) {
+            String sub = text.substring(0, len);
+            if (d.textWidth(sub) + ellipsisW <= maxWidth) {
+                return sub + ellipsis;
+            }
+            len--;
+        }
+        return ellipsis;
+    }
+
+    String makeIndent(int targetWidth, M5GFX& d) const {
+        String indent;
+        while (d.textWidth(indent) < targetWidth && indent.length() < 40) {
+            indent += " ";
+        }
+        return indent;
+    }
+
+    void appendWrappedText(const String& prefix,
+                           const String& text,
+                           int maxWidth,
+                           M5GFX& d,
+                           std::vector<String>& out) const {
+        String effectivePrefix = prefix;
+        if (d.textWidth(effectivePrefix) > maxWidth) {
+            effectivePrefix = truncateToWidth(effectivePrefix, maxWidth, d);
+        }
+        int prefixWidth = d.textWidth(effectivePrefix);
+        String indent = makeIndent(prefixWidth, d);
+
+        String clean = text;
+        clean.replace('\n', ' ');
+
+        String current = effectivePrefix;
+        int currentWidth = prefixWidth;
+        bool hasText = false;
+        int wordCount = 0;
+
+        int len = clean.length();
+        int i = 0;
+        while (i < len) {
+            while (i < len && clean[i] == ' ') {
+                i++;
+            }
+            int start = i;
+            while (i < len && clean[i] != ' ') {
+                i++;
+            }
+            if (start >= i) {
+                break;
+            }
+            String word = clean.substring(start, i);
+            wordCount++;
+
+            int wordWidth = d.textWidth(word);
+            int spaceWidth = hasText ? d.textWidth(" ") : 0;
+
+            if (currentWidth + spaceWidth + wordWidth <= maxWidth) {
+                if (hasText) {
+                    current += " ";
+                    currentWidth += spaceWidth;
+                }
+                current += word;
+                currentWidth += wordWidth;
+                hasText = true;
+                continue;
+            }
+
+            if (hasText) {
+                out.push_back(current);
+                current = indent;
+                currentWidth = d.textWidth(current);
+                hasText = false;
+            }
+
+            if (currentWidth + wordWidth > maxWidth) {
+                int pos = 0;
+                int wlen = word.length();
+                while (pos < wlen) {
+                    int chunkLen = wlen - pos;
+                    while (chunkLen > 0) {
+                        String chunk = word.substring(pos, pos + chunkLen);
+                        if (currentWidth + d.textWidth(chunk) <= maxWidth) {
+                            current += chunk;
+                            currentWidth += d.textWidth(chunk);
+                            hasText = true;
+                            pos += chunkLen;
+                            break;
+                        }
+                        chunkLen--;
+                    }
+                    if (chunkLen == 0) {
+                        String chunk = word.substring(pos, pos + 1);
+                        current += chunk;
+                        currentWidth += d.textWidth(chunk);
+                        hasText = true;
+                        pos += 1;
+                    }
+                    if (pos < wlen) {
+                        out.push_back(current);
+                        current = indent;
+                        currentWidth = d.textWidth(current);
+                        hasText = false;
+                    }
+                }
+            } else {
+                current += word;
+                currentWidth += wordWidth;
+                hasText = true;
+            }
+        }
+
+        if (wordCount == 0) {
+            out.push_back(effectivePrefix);
+        } else if (hasText) {
+            out.push_back(current);
+        }
+    }
+
+    void buildWrappedLines(const Conversation& conv,
+                           M5GFX& d,
+                           std::vector<String>& out) const {
+        out.clear();
+        d.setTextSize(1);
+        int maxWidth = d.width() - 4;
+        for (const auto& msg : conv.messages) {
+            String label = msg.fromMe ? String("Me") : gMesh.nodeLabel(msg.from);
+            String prefix = label + "> ";
+            appendWrappedText(prefix, msg.text, maxWidth, d, out);
+        }
+    }
+
     String inputBuffer;
 };
 
