@@ -18,6 +18,7 @@ enum class ConnectionStatus {
 struct MeshDeviceInfo {
     String name;
     String id;   // MAC address as text ("00:4b:12:b1:19:f6")
+    uint8_t addrType = BLE_ADDR_PUBLIC; // Use address type from scan (public/random)
 };
 
 // Minimal info for a known Meshtastic node

@@ -222,6 +222,7 @@ void MeshtasticClient::startScan() {
 
             std::string name = dev->getName();
             std::string addr = dev->getAddress().toString();
+            uint8_t addrType = dev->getAddressType();
             bool isMesh = dev->isAdvertisingService(meshSvcUuid);
 
             Serial.printf("[Mesh] Dev %d: name='%s' addr=%s mesh=%d\n",
@@ -259,6 +260,7 @@ void MeshtasticClient::startScan() {
                     if (existing.name == existing.id && nameStr != addrStr) {
                         existing.name = nameStr;
                     }
+                    existing.addrType = addrType;
                     break;
                 }
             }
@@ -266,6 +268,7 @@ void MeshtasticClient::startScan() {
                 MeshDeviceInfo info;
                 info.name = nameStr;
                 info.id   = addrStr;
+                info.addrType = addrType;
                 _devices.push_back(info);
             }
         }
@@ -303,7 +306,9 @@ int MeshtasticClient::getDeviceCount() const {
 }
 
 MeshDeviceInfo MeshtasticClient::getDeviceInfo(int index) const {
-    MeshDeviceInfo dummy{"<invalid>", ""};
+    MeshDeviceInfo dummy;
+    dummy.name = "<invalid>";
+    dummy.id = "";
     if (index < 0 || index >= (int)_devices.size()) return dummy;
     return _devices[index];
 }
@@ -555,7 +560,7 @@ bool MeshtasticClient::connectToIndex(int index) {
 
     // Build address from string "00:4b:12:b1:19:f6"
     std::string addrStr(info.id.c_str());
-    NimBLEAddress addr(addrStr, BLE_ADDR_PUBLIC);
+    NimBLEAddress addr(addrStr, info.addrType);
 
     // Async connect to keep UI responsive during pairing
     bool ok = _client->connect(addr, true, true);
