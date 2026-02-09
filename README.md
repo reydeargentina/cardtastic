@@ -2,7 +2,7 @@
 
 Cardtastic is a simple, fast UI for Meshtastic nodes running on the M5Stack Cardputer v1.1. It connects to a Meshtastic radio over BLE and focuses on chat, nodes, and channels without changing device configuration.
 
-Current version: v0.5
+Current version: v0.5 (see `CHANGELOG.md`)
 
 ## Features
 - BLE scan and connect to Meshtastic radios
@@ -40,7 +40,12 @@ monitor_port = /dev/serial/by-id/usb-...
 ```
 
 ## Usage
-It's important to note that Cardtastic is intendend to be used as a simple UI to interact with an already configured node. The use case I thought about is to use it to read and send messages when I'm on the go, so I don't have to use my phone. As a result, it will not be useful to configure the node for the first time.
+It's important to note that Cardtastic is intended to be used as a simple UI to interact with an already configured node. The use case is to read and send messages when you're on the go, without using a phone. It does not change core node configuration (region, channels, frequencies); set those in the Meshtastic phone app first.
+
+Quick start:
+- Scan for devices.
+- Connect to your node.
+- Open Conversations or Channels and start chatting.
 - Connect: use Scan to find radios, then connect.
 - Conversations: open recent chats; unread messages show a `*`.
 - Channels: open a broadcast chat by channel.
@@ -52,7 +57,7 @@ Navigation (Cardputer keyboard):
 - Chat scroll: hold FN and use `;` (up) / `.` (down). Hold Shift for page scroll.
 
 ## BLE Passkey (v0.5)
-Cardtastic v0.5 prompts for the BLE PIN when the node requests it. If the node is already bonded, it connects without prompting. Use the PIN shown on the node when pairing.
+Cardtastic prompts for the BLE PIN when the node requests it. If the node is already bonded, it connects without prompting. Use the PIN shown on the node when pairing.
 
 ## Persistence (SD)
 If a microSD card is present, Cardtastic stores conversations as JSON under `/cardtastic/` on the card. The app keeps the most recent 50 messages per conversation. If no card is available, conversations live in RAM only.
