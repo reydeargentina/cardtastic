@@ -551,6 +551,9 @@ const char* connectionStatusLabel() {
     case ConnectionStatus::CONNECTING:
         return "CONNECTING";
     case ConnectionStatus::CONNECTED:
+        if (gMesh.lastError().length() > 0) {
+            return "CONNECTED!";
+        }
         return "CONNECTED";
     case ConnectionStatus::ERROR:
         return "ERROR";
@@ -561,6 +564,9 @@ const char* connectionStatusLabel() {
 uint16_t connectionStatusColor() {
     switch (gMesh.status()) {
     case ConnectionStatus::CONNECTED:
+        if (gMesh.lastError().length() > 0) {
+            return YELLOW;
+        }
         return GREEN;
     case ConnectionStatus::SCANNING:
     case ConnectionStatus::CONNECTING:
@@ -815,7 +821,7 @@ public:
         // --- Header (small text) ---
         d.setTextSize(1);
         d.setTextColor(kColorHeaderText, kColorHeaderBg);
-        String title = "Cardtastic 0.2";
+        String title = "Cardtastic 0.5";
         int titleX = (d.width() - d.textWidth(title)) / 2;
         if (titleX < 0) titleX = 0;
         d.setCursor(titleX, 4);
@@ -923,8 +929,13 @@ public:
 
         d.setCursor(4, 14);
         if (gMesh.status() == ConnectionStatus::CONNECTED) {
-            d.print("Radio: ");
-            d.println(gMesh.radioName());
+            if (gMesh.lastError().length() > 0) {
+                d.print("Warn: ");
+                d.println(gMesh.lastError());
+            } else {
+                d.print("Radio: ");
+                d.println(gMesh.radioName());
+            }
         } else if (gMesh.status() == ConnectionStatus::ERROR) {
             d.print("Error: ");
             d.println(gMesh.lastError());
@@ -966,7 +977,7 @@ public:
                 MeshDeviceInfo info = gMesh.getDeviceInfo(devIndex);
 
                 String label = info.name;
-                if (gMesh.isConnected() && gMesh.radioName() == info.name) {
+                if (gMesh.isConnected() && gMesh.connectedDeviceIndex() == devIndex) {
                     label += " [C]";
                 }
                 d.println(label);

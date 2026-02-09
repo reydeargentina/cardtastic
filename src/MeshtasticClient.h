@@ -122,6 +122,7 @@ private:
     // --- Internal helpers ---
     void pullFromRadioUntilEmpty(bool logEmpty = true);
     bool decodeFromRadioAndQueue(const uint8_t* data, size_t len);
+    bool writeToRadio(const uint8_t* data, size_t len, const char* context);
     MeshNodeInfo* getOrCreateNode(uint32_t num);
     MeshChannelInfo* getOrCreateChannel(int8_t index);
     void resetConnectionState(bool clearNodes);
@@ -148,6 +149,9 @@ private:
     bool                        _needsPull;
     bool                        _configRequested;
     bool                        _configComplete;
+    uint8_t                     _configAttempts;
+    uint32_t                    _configRequestMs;
+    uint32_t                    _nextConfigAttemptMs;
     uint32_t                    _nextPacketId;
     uint32_t                    _lastPollMs;
     uint32_t                    _lastFromNum;

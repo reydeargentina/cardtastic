@@ -9,6 +9,9 @@ extern MeshtasticClient gMesh;
 namespace {
 constexpr int kScanAttempts = 3;
 constexpr int kScanSeconds = 8;
+constexpr uint8_t kMaxConfigAttempts = 4;
+constexpr uint32_t kConfigRetryMs = 1000;
+constexpr uint32_t kConfigRequestTimeoutMs = 4000;
 
 class MeshClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) override {
@@ -62,6 +65,9 @@ MeshtasticClient::MeshtasticClient()
       _needsPull(false),
       _configRequested(false),
       _configComplete(false),
+      _configAttempts(0),
+      _configRequestMs(0),
+      _nextConfigAttemptMs(0),
       _nextPacketId(1),
       _lastPollMs(0),
       _lastFromNum(0),
@@ -99,6 +105,9 @@ void MeshtasticClient::begin() {
     _needsPull      = false;
     _configRequested = false;
     _configComplete = false;
+    _configAttempts = 0;
+    _configRequestMs = 0;
+    _nextConfigAttemptMs = 0;
     _nextPacketId   = 1;
     _lastPollMs     = 0;
     _lastFromNum    = 0;
@@ -124,6 +133,8 @@ void MeshtasticClient::loop() {
         return;
     }
 
+    uint32_t now = millis();
+
     if (_needsServiceDiscovery) {
         NimBLEConnInfo info = _client->getConnInfo();
         if (!info.isEncrypted()) {
@@ -140,13 +151,32 @@ void MeshtasticClient::loop() {
             // discoverMeshtasticService sets ERROR if something fails
             return;
         }
+        _configAttempts = 0;
+        _nextConfigAttemptMs = now;
+    }
 
-        if (!requestConfig()) {
-            Serial.println("[Mesh] Failed to request config");
+    if (!_configComplete) {
+        if (_configRequested) {
+            if (_configRequestMs > 0 && (now - _configRequestMs) > kConfigRequestTimeoutMs) {
+                Serial.println("[Mesh] Config request timed out");
+                _configRequested = false;
+                _configRequestMs = 0;
+                _configAttempts++;
+                _nextConfigAttemptMs = now + kConfigRetryMs;
+                _lastError = "Config timeout";
+            }
+        } else if (_configAttempts < kMaxConfigAttempts && now >= _nextConfigAttemptMs) {
+            if (!requestConfig()) {
+                _configAttempts++;
+                _nextConfigAttemptMs = now + kConfigRetryMs;
+                Serial.printf("[Mesh] requestConfig failed (attempt %u/%u)\n",
+                              (unsigned)_configAttempts,
+                              (unsigned)kMaxConfigAttempts);
+                _lastError = "Config request failed";
+            }
         }
     }
 
-    uint32_t now = millis();
     uint32_t pollIntervalMs = (_configRequested && !_configComplete) ? 50 : 1000;
     if (_needsPull) {
         _needsPull = false;
@@ -418,6 +448,9 @@ void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _needsPull      = false;
     _configRequested = false;
     _configComplete = false;
+    _configAttempts = 0;
+    _configRequestMs = 0;
+    _nextConfigAttemptMs = 0;
     _nextPacketId   = 1;
     _lastPollMs     = 0;
     _lastFromNum    = 0;
@@ -520,6 +553,11 @@ bool MeshtasticClient::connectToIndex(int index) {
         return false;
     }
     _authFailed = false;
+
+    if (_client && _client->isConnected() && _status != ConnectionStatus::CONNECTED) {
+        Serial.println("[Mesh] Client connected while status not CONNECTED, disconnecting");
+        disconnect();
+    }
 
     // Toggle: if already connected to this index, disconnect
     if (_status == ConnectionStatus::CONNECTED && _connectedIndex == index) {
@@ -645,8 +683,16 @@ void MeshtasticClient::disconnect() {
 }
 
 void MeshtasticClient::handleDisconnect(int reason) {
+    bool wasAuthFailed = _authFailed;
+    String priorError = _lastError;
     resetConnectionState(false);
-    _lastError = String("Disconnected (") + reason + ")";
+    if (wasAuthFailed) {
+        _authFailed = true;
+        _status = ConnectionStatus::ERROR;
+        _lastError = priorError.length() > 0 ? priorError : "Auth failed";
+    } else {
+        _lastError = String("Disconnected (") + reason + ")";
+    }
 }
 
 void MeshtasticClient::handleConnect(NimBLEClient* pClient) {
@@ -677,6 +723,9 @@ void MeshtasticClient::handleConnect(NimBLEClient* pClient) {
     _needsPull = false;
     _configRequested = false;
     _configComplete = false;
+    _configAttempts = 0;
+    _configRequestMs = 0;
+    _nextConfigAttemptMs = 0;
 }
 
 void MeshtasticClient::handleConnectFail(NimBLEClient* pClient, int reason) {
@@ -697,6 +746,9 @@ void MeshtasticClient::handleAuthComplete(const NimBLEConnInfo& connInfo) {
         _authFailed = true;
         _status = ConnectionStatus::ERROR;
         _lastError = "Auth failed";
+        if (_client && _client->isConnected()) {
+            _client->disconnect();
+        }
     } else {
         _authFailed = false;
     }
@@ -723,6 +775,31 @@ String MeshtasticClient::nodeLabel(uint32_t nodeNum) const {
     return String("0x") + hex;
 }
 
+bool MeshtasticClient::writeToRadio(const uint8_t* data, size_t len, const char* context) {
+    if (!_client || !_client->isConnected()) {
+        _lastError = "Not connected";
+        return false;
+    }
+    if (!_charToRadio) {
+        _lastError = "Mesh char missing";
+        return false;
+    }
+
+    bool canWrite = _charToRadio->canWrite();
+    bool canWriteNr = _charToRadio->canWriteNoResponse();
+    if (!canWrite && !canWriteNr) {
+        _lastError = "Mesh char not writable";
+        return false;
+    }
+
+    bool useResponse = canWrite;
+    bool ok = _charToRadio->writeValue(data, len, useResponse);
+    if (!ok) {
+        _lastError = String(context) + " write failed";
+    }
+    return ok;
+}
+
 bool MeshtasticClient::requestConfig() {
     if (!_client || !_client->isConnected() || !_charToRadio) return false;
     if (_configRequested) return true;
@@ -743,26 +820,28 @@ bool MeshtasticClient::requestConfig() {
         return false;
     }
 
-    bool ok = _charToRadio->writeValue(buf, stream.bytes_written, true);
+    bool ok = writeToRadio(buf, stream.bytes_written, "Config");
     if (ok) {
         _configRequested = true;
         _configComplete = false;
         _needsPull = true;
+        _configRequestMs = millis();
+        _configAttempts = 0;
+        _nextConfigAttemptMs = 0;
+        if (_lastError.startsWith("Config")) {
+            _lastError = "";
+        }
     }
     return ok;
 }
 
 bool MeshtasticClient::sendTextMessage(const String& text, uint32_t dest, uint8_t channel) {
-    if (!_client || !_client->isConnected()) {
-        _lastError = "Not connected";
-        return false;
-    }
-    if (!_charToRadio) {
-        _lastError = "Mesh char missing";
-        return false;
-    }
     if (text.length() == 0) {
         _lastError = "Empty message";
+        return false;
+    }
+    if (!_client || !_client->isConnected()) {
+        _lastError = "Not connected";
         return false;
     }
 
@@ -798,13 +877,10 @@ bool MeshtasticClient::sendTextMessage(const String& text, uint32_t dest, uint8_
         return false;
     }
 
-    bool ok = _charToRadio->writeValue(buf, stream.bytes_written, true);
+    bool ok = writeToRadio(buf, stream.bytes_written, "Send");
     Serial.printf("[Mesh] Send text len=%u -> %s\n",
                   (unsigned)len,
                   ok ? "ok" : "fail");
-    if (!ok) {
-        _lastError = "Write failed";
-    }
     return ok;
 }
 
@@ -904,6 +980,9 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
         _configComplete = true;
         Serial.printf("[Mesh] Config complete (id=%lu)\n",
                       (unsigned long)fr.config_complete_id);
+        if (_lastError.startsWith("Config")) {
+            _lastError = "";
+        }
         return true;
     }
 

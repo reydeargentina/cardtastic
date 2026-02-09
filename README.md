@@ -2,6 +2,8 @@
 
 Cardtastic is a simple, fast UI for Meshtastic nodes running on the M5Stack Cardputer v1.1. It connects to a Meshtastic radio over BLE and focuses on chat, nodes, and channels without changing device configuration.
 
+Current version: v0.5
+
 ## Features
 - BLE scan and connect to Meshtastic radios
 - Conversations list with unread markers and last-message previews
@@ -49,8 +51,8 @@ Navigation (Cardputer keyboard):
 - Chat: type to compose, Enter to send.
 - Chat scroll: hold FN and use `;` (up) / `.` (down). Hold Shift for page scroll.
 
-## BLE Passkey (v0.2)
-Cardtastic v0.2 prompts for the BLE PIN when the node requests it. If the node is already bonded, it connects without prompting. Use the PIN shown on the node when pairing.
+## BLE Passkey (v0.5)
+Cardtastic v0.5 prompts for the BLE PIN when the node requests it. If the node is already bonded, it connects without prompting. Use the PIN shown on the node when pairing.
 
 ## Persistence (SD)
 If a microSD card is present, Cardtastic stores conversations as JSON under `/cardtastic/` on the card. The app keeps the most recent 50 messages per conversation. If no card is available, conversations live in RAM only.
