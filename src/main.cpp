@@ -20,7 +20,8 @@ enum class NavKey {
     DOWN,
     DOWN_FAST,
     ENTER,
-    ESC
+    ESC,
+    TOGGLE_AUTOCONNECT
 };
 
 // -------------------- Conversation / Message model (RAM only for now) --------------------
@@ -39,6 +40,9 @@ constexpr uint16_t kColorFooterBg = DARKGREEN;
 constexpr uint16_t kColorFooterText = WHITE;
 constexpr uint16_t kColorSeparator = GREEN;
 constexpr int kFooterH = 10;
+static int gScanSecondsLeft = -1;
+static int gScanAttempt = 0;
+static int gScanAttempts = 0;
 
 void drawHeaderBackground(int height) {
     if (height <= 0) return;
@@ -538,6 +542,9 @@ void drawHeaderRightStatus(const String& line1, const String& line2) {
 }
 
 void drawScanCountdown(int secondsLeft, int attempt, int attempts) {
+    gScanSecondsLeft = secondsLeft;
+    gScanAttempt = attempt;
+    gScanAttempts = attempts;
     if (secondsLeft < 0) {
         drawHeaderRightStatus("", "");
         return;
@@ -813,6 +820,7 @@ public:
     void switchTo(ScreenId id);
     void handleNav(NavKey k);
     void loop();
+    void redrawCurrentScreenNow();
 
 private:
     ScreenId currentId;
@@ -835,6 +843,7 @@ private:
 };
 
 extern ScreenManager gScreens;
+void redrawConnectScreenForScan();
 
 // -------------------- Home screen (list) --------------------
 
@@ -936,6 +945,9 @@ public:
         case NavKey::ENTER:
             handleEnter();
             break;
+        case NavKey::TOGGLE_AUTOCONNECT:
+            gMesh.toggleAutoConnect();
+            break;
         default:
             break;
         }
@@ -1033,7 +1045,9 @@ public:
         d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
         d.setCursor(4, h - kFooterH + 1);
-        d.print("Enter/Right: scan/connect   Backspace/Left: back");
+        String footer = String("A:Auto ") + (gMesh.autoConnectEnabled() ? "ON" : "OFF");
+        footer += gMesh.isScanning() ? "  Scanning..." : "  Enter:select Del:back";
+        d.print(footer);
     }
 
 private:
@@ -1050,13 +1064,17 @@ private:
 
         if (sel == 0) {
             // Scan for devices
+            gMesh.cancelAutoConnectRetries();
             gMesh.setScanProgressCallback(drawScanCountdown);
+            gMesh.setScanResultsCallback(redrawConnectScreenForScan);
             gMesh.startScan();
             gMesh.setScanProgressCallback(nullptr);
+            gMesh.setScanResultsCallback(nullptr);
             menu.reset();
         } else {
             int devIndex = sel - 1;
             drawHeaderRightStatus("Connecting", "");
+            gMesh.cancelAutoConnectRetries();
             gMesh.clearPasskey();
             gMesh.connectToIndex(devIndex);
         }
@@ -2239,6 +2257,7 @@ void ScreenManager::handleNav(NavKey k) {
     // Global "back": go to Home from any screen except Home
     if (k == NavKey::ESC) {
         if (currentId == ScreenId::PIN_ENTRY) {
+            gMesh.cancelAutoConnectRetries();
             gMesh.disconnect();
             switchTo(ScreenId::CONNECT);
             return;
@@ -2312,6 +2331,19 @@ void ScreenManager::redrawIfNeeded() {
     if (needRedraw && currentScreen) {
         currentScreen->draw();
         needRedraw = false;
+    }
+}
+
+void ScreenManager::redrawCurrentScreenNow() {
+    if (!currentScreen) return;
+    currentScreen->draw();
+    needRedraw = false;
+}
+
+void redrawConnectScreenForScan() {
+    gScreens.redrawCurrentScreenNow();
+    if (gScanSecondsLeft >= 0) {
+        drawScanCountdown(gScanSecondsLeft, gScanAttempt, gScanAttempts);
     }
 }
 
@@ -2477,6 +2509,13 @@ void ScreenManager::loop() {
                 for (auto c : st.word) {
                     switch (c) {
 
+                    case 'a':
+                    case 'A':
+                        if (currentId == ScreenId::CONNECT) {
+                            nk = NavKey::TOGGLE_AUTOCONNECT;
+                        }
+                        break;
+
                     // UP: Up-arrow / ';' + fallback W
                     case ';':
                     case ':':
@@ -2551,6 +2590,7 @@ void setup() {
     gLastSdAttemptMs = millis();
     gLastInputMs = millis();
     tryLoadConversationsOnce();
+    gMesh.connectToLastDevice();
 }
 
 

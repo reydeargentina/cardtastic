@@ -80,6 +80,8 @@ public:
 
     using ScanProgressCallback = void (*)(int secondsLeft, int attempt, int attempts);
     void setScanProgressCallback(ScanProgressCallback cb) { _scanProgressCb = cb; }
+    using ScanResultsCallback = void (*)();
+    void setScanResultsCallback(ScanResultsCallback cb) { _scanResultsCb = cb; }
 
     // ---- General state ----
     ConnectionStatus status()      const { return _status; }
@@ -95,6 +97,10 @@ public:
     bool          discoverMeshtasticService();
     int           getDeviceCount() const;
     MeshDeviceInfo getDeviceInfo(int index) const;
+    bool          autoConnectEnabled() const { return _autoConnectEnabled; }
+    void          toggleAutoConnect();
+    bool          connectToLastDevice();
+    void          cancelAutoConnectRetries();
 
     // ---- Known nodes ----
     int           getNodeCount() const;
@@ -138,6 +144,7 @@ private:
     void pullFromRadioUntilEmpty(bool logEmpty = true);
     bool decodeFromRadioAndQueue(const uint8_t* data, size_t len);
     bool writeToRadio(const uint8_t* data, size_t len, const char* context);
+    bool ingestScanObservation(const char* address, const char* name, uint8_t addrType);
     MeshNodeInfo* getOrCreateNode(uint32_t num);
     MeshChannelInfo* getOrCreateChannel(int8_t index);
     void resetConnectionState(bool clearNodes);
@@ -151,6 +158,12 @@ private:
                             int errorReason);
     void finishDelivery(uint32_t token, MeshDeliveryStage stage);
     void expirePendingDeliveries(uint32_t now);
+    void loadConnectionPreferences();
+    void saveAutoConnectPreference();
+    void saveLastConnectedDevice();
+    bool attemptAutoConnect();
+    void scheduleAutoConnectRetry(const char* reason);
+    void processAutoConnectRetries(uint32_t now);
     void handleFromNumNotify(NimBLERemoteCharacteristic* chr,
                              uint8_t* data, size_t len, bool isNotify);
     void handleLogNotify(NimBLERemoteCharacteristic* chr,
@@ -168,6 +181,15 @@ private:
     int                         _pendingConnectIndex;
     bool                        _scanning;
     int                         _connectedIndex;
+    bool                        _autoConnectEnabled;
+    String                      _lastDeviceAddress;
+    String                      _lastDeviceName;
+    uint8_t                     _lastDeviceAddrType;
+    bool                        _autoConnectStartup;
+    bool                        _autoConnectRetryPending;
+    uint8_t                     _autoConnectAttempts;
+    uint32_t                    _autoConnectAttemptStartedMs;
+    uint32_t                    _nextAutoConnectAttemptMs;
     uint32_t                    _myNodeNum;
     bool                        _needsPull;
     bool                        _configRequested;
@@ -194,6 +216,7 @@ private:
     std::vector<MeshChannelInfo> _channels;
     NimBLEClient*               _client;
     ScanProgressCallback        _scanProgressCb = nullptr;
+    ScanResultsCallback         _scanResultsCb = nullptr;
 
     NimBLERemoteService*        _svc;
     NimBLERemoteCharacteristic* _charToRadio;    // f75c... (write)

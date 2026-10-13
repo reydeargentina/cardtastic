@@ -1,5 +1,8 @@
 #include "MeshtasticClient.h"
 
+#include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
 #include <pb_decode.h>
 #include <pb_encode.h>
 #include "meshtastic/mesh.pb.h"
@@ -9,9 +12,72 @@ extern MeshtasticClient gMesh;
 namespace {
 constexpr int kScanAttempts = 3;
 constexpr int kScanSeconds = 8;
+constexpr uint8_t kMaxAutoConnectAttempts = 3;
+constexpr uint32_t kAutoConnectAttemptTimeoutMs = 15000;
+constexpr uint32_t kAutoConnectRetryDelaysMs[] = {1000, 2500};
 constexpr uint8_t kMaxConfigAttempts = 4;
 constexpr uint32_t kConfigRetryMs = 1000;
 constexpr uint32_t kConfigRequestTimeoutMs = 4000;
+constexpr size_t kScanObservationCapacity = 24;
+
+struct ScanObservation {
+    char address[18];
+    char name[64];
+    uint8_t addrType;
+};
+
+ScanObservation gScanObservations[kScanObservationCapacity];
+volatile size_t gScanObservationRead = 0;
+volatile size_t gScanObservationWrite = 0;
+volatile size_t gScanObservationCount = 0;
+portMUX_TYPE gScanObservationMux = portMUX_INITIALIZER_UNLOCKED;
+
+bool popScanObservation(ScanObservation& out) {
+    bool found = false;
+    portENTER_CRITICAL(&gScanObservationMux);
+    if (gScanObservationCount > 0) {
+        out = gScanObservations[gScanObservationRead];
+        gScanObservationRead = (gScanObservationRead + 1) % kScanObservationCapacity;
+        --gScanObservationCount;
+        found = true;
+    }
+    portEXIT_CRITICAL(&gScanObservationMux);
+    return found;
+}
+
+class MeshScanCallbacks : public NimBLEScanCallbacks {
+    void queueObservation(const NimBLEAdvertisedDevice* dev) {
+        if (!dev) return;
+        static NimBLEUUID meshSvcUuid("6ba1b218-15a8-461f-9fa8-5dcae273eafd");
+        if (!dev->isAdvertisingService(meshSvcUuid)) return;
+
+        std::string address = dev->getAddress().toString();
+        std::string name = dev->getName();
+        if (name.empty()) name = dev->getPayloadByType(0x09);
+        if (name.empty()) name = dev->getPayloadByType(0x08);
+
+        ScanObservation observation{};
+        snprintf(observation.address, sizeof(observation.address), "%s", address.c_str());
+        snprintf(observation.name, sizeof(observation.name), "%s", name.c_str());
+        observation.addrType = dev->getAddressType();
+
+        portENTER_CRITICAL(&gScanObservationMux);
+        if (gScanObservationCount < kScanObservationCapacity) {
+            gScanObservations[gScanObservationWrite] = observation;
+            gScanObservationWrite = (gScanObservationWrite + 1) % kScanObservationCapacity;
+            ++gScanObservationCount;
+        }
+        portEXIT_CRITICAL(&gScanObservationMux);
+    }
+
+    void onDiscovered(const NimBLEAdvertisedDevice* dev) override {
+        queueObservation(dev);
+    }
+
+    void onResult(const NimBLEAdvertisedDevice* dev) override {
+        queueObservation(dev);
+    }
+};
 
 class MeshClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) override {
@@ -43,6 +109,7 @@ class MeshClientCallbacks : public NimBLEClientCallbacks {
 };
 
 MeshClientCallbacks gClientCallbacks;
+MeshScanCallbacks gScanCallbacks;
 } // namespace
 
 // Global instance
@@ -61,6 +128,15 @@ MeshtasticClient::MeshtasticClient()
       _pendingConnectIndex(-1),
       _scanning(false),
       _connectedIndex(-1),
+      _autoConnectEnabled(true),
+      _lastDeviceAddress(""),
+      _lastDeviceName(""),
+      _lastDeviceAddrType(BLE_ADDR_PUBLIC),
+      _autoConnectStartup(false),
+      _autoConnectRetryPending(false),
+      _autoConnectAttempts(0),
+      _autoConnectAttemptStartedMs(0),
+      _nextAutoConnectAttemptMs(0),
       _myNodeNum(0),
       _needsPull(false),
       _configRequested(false),
@@ -76,6 +152,7 @@ MeshtasticClient::MeshtasticClient()
       _deliveryUpdates(),
       _client(nullptr),
       _scanProgressCb(nullptr),
+      _scanResultsCb(nullptr),
       _svc(nullptr),
       _charToRadio(nullptr),
       _charFromRadio(nullptr),
@@ -104,6 +181,11 @@ void MeshtasticClient::begin() {
     _pendingConnectIndex = -1;
     _scanning       = false;
     _connectedIndex = -1;
+    _autoConnectStartup = false;
+    _autoConnectRetryPending = false;
+    _autoConnectAttempts = 0;
+    _autoConnectAttemptStartedMs = 0;
+    _nextAutoConnectAttemptMs = 0;
     _myNodeNum      = 0;
     _needsPull      = false;
     _configRequested = false;
@@ -123,6 +205,8 @@ void MeshtasticClient::begin() {
     _channels.clear();
     _knownDevices.clear();
     _scanProgressCb = nullptr;
+    _scanResultsCb = nullptr;
+    loadConnectionPreferences();
 
     _client         = nullptr;
     _svc            = nullptr;
@@ -134,6 +218,7 @@ void MeshtasticClient::begin() {
 
 void MeshtasticClient::loop() {
     uint32_t now = millis();
+    processAutoConnectRetries(now);
     if (!_client || !_client->isConnected()) {
         expirePendingDeliveries(now);
         return;
@@ -157,9 +242,18 @@ void MeshtasticClient::loop() {
         // Discover and subscribe to MeshBluetoothService
         if (!discoverMeshtasticService()) {
             Serial.println("[Mesh] discoverMeshtasticService() failed after connect");
-            // discoverMeshtasticService sets ERROR if something fails
+            if (_client && _client->isConnected()) {
+                _client->disconnect();
+            }
+            resetConnectionState(false);
+            _status = ConnectionStatus::ERROR;
+            _lastError = "Mesh service discovery failed";
+            scheduleAutoConnectRetry("Meshtastic service discovery failed");
             return;
         }
+        saveLastConnectedDevice();
+        _autoConnectStartup = false;
+        _autoConnectRetryPending = false;
         _configAttempts = 0;
         _nextConfigAttemptMs = now;
     }
@@ -201,8 +295,63 @@ void MeshtasticClient::loop() {
 
 // ---- Scan and devices ----
 
+bool MeshtasticClient::ingestScanObservation(const char* address,
+                                            const char* name,
+                                            uint8_t addrType) {
+    if (!address || address[0] == '\0') return false;
+
+    String addrStr(address);
+    String nameStr(name ? name : "");
+    if (nameStr.length() == 0) {
+        nameStr = lookupKnownDeviceName(addrStr);
+    }
+    if (nameStr.length() == 0 && addrStr == _lastDeviceAddress) {
+        nameStr = _lastDeviceName;
+    }
+    if (nameStr.length() == 0) {
+        nameStr = addrStr;
+    }
+
+    for (auto& existing : _devices) {
+        if (existing.id != addrStr) continue;
+
+        bool changed = false;
+        if (existing.addrType != addrType) {
+            existing.addrType = addrType;
+            changed = true;
+        }
+        if (existing.name == existing.id && nameStr != addrStr) {
+            existing.name = nameStr;
+            changed = true;
+            Serial.printf("[Mesh] BLE name resolved: '%s' (%s)\n",
+                          nameStr.c_str(), addrStr.c_str());
+        }
+        if (nameStr != addrStr) {
+            updateKnownDeviceName(addrStr, nameStr);
+        }
+        return changed;
+    }
+
+    MeshDeviceInfo info;
+    info.name = nameStr;
+    info.id = addrStr;
+    info.addrType = addrType;
+    _devices.push_back(info);
+    if (nameStr != addrStr) {
+        updateKnownDeviceName(addrStr, nameStr);
+    }
+    Serial.printf("[Mesh] Found Meshtastic device: name='%s' addr=%s type=%u\n",
+                  info.name.c_str(),
+                  info.id.c_str(),
+                  (unsigned)info.addrType);
+    return true;
+}
+
 void MeshtasticClient::startScan() {
     _devices.clear();
+    ScanObservation staleObservation;
+    while (popScanObservation(staleObservation)) {
+    }
     _lastError = "";
     _scanning  = true;
     _status    = ConnectionStatus::SCANNING;
@@ -214,14 +363,14 @@ void MeshtasticClient::startScan() {
     pScan->setActiveScan(true);        // request more info (name, etc.)
     pScan->setInterval(160);           // 100 ms
     pScan->setWindow(80);              //  50 ms (<= interval)
-    pScan->setDuplicateFilter(false);  // keep duplicates; we dedupe by MAC
+    pScan->setScanCallbacks(&gScanCallbacks, true); // accept duplicates so scan responses can supply the name
     pScan->clearResults();             // clear previous results
 
     int totalFound = 0;
-    static NimBLEUUID meshSvcUuid("6ba1b218-15a8-461f-9fa8-5dcae273eafd");
     for (int attempt = 0; attempt < kScanAttempts; ++attempt) {
         Serial.printf("[Mesh] Scan attempt %d/%d\n", attempt + 1, kScanAttempts);
         uint32_t startMs = millis();
+        uint32_t lastResultsCheckMs = 0;
         int lastRemaining = kScanSeconds;
         if (_scanProgressCb) {
             _scanProgressCb(lastRemaining, attempt + 1, kScanAttempts);
@@ -238,8 +387,22 @@ void MeshtasticClient::startScan() {
 
         while (pScan->isScanning()) {
             delay(50);
+            uint32_t now = millis();
+            if (now - lastResultsCheckMs >= 50) {
+                lastResultsCheckMs = now;
+                ScanObservation observation;
+                bool changed = false;
+                while (popScanObservation(observation)) {
+                    changed = ingestScanObservation(observation.address,
+                                                    observation.name,
+                                                    observation.addrType) || changed;
+                }
+                if (changed && _scanResultsCb) {
+                    _scanResultsCb();
+                }
+            }
             if (_scanProgressCb) {
-                int elapsed = (int)((millis() - startMs) / 1000UL);
+                int elapsed = (int)((now - startMs) / 1000UL);
                 int remaining = kScanSeconds - elapsed;
                 if (remaining < 0) remaining = 0;
                 if (remaining != lastRemaining) {
@@ -252,67 +415,17 @@ void MeshtasticClient::startScan() {
             _scanProgressCb(0, attempt + 1, kScanAttempts);
         }
 
-        NimBLEScanResults results = pScan->getResults();
-        int count = results.getCount();
-        Serial.printf("[Mesh] Scan done, results=%d\n", count);
-
-        constexpr uint16_t kAdvTypeIncompleteName = 0x08;
-        for (int i = 0; i < count; ++i) {
-            const NimBLEAdvertisedDevice* dev = results.getDevice(i);
-            if (!dev) continue;
-
-            std::string name = dev->getName();
-            std::string addr = dev->getAddress().toString();
-            uint8_t addrType = dev->getAddressType();
-            bool isMesh = dev->isAdvertisingService(meshSvcUuid);
-
-            Serial.printf("[Mesh] Dev %d: name='%s' addr=%s mesh=%d\n",
-                          i, name.c_str(), addr.c_str(), isMesh ? 1 : 0);
-
-            if (!isMesh) {
-                continue;
-            }
-
-            String addrStr = String(addr.c_str());
-            String nameStr = String(name.c_str());
-            if (nameStr.length() == 0) {
-                std::string shortName = dev->getPayloadByType(kAdvTypeIncompleteName);
-                if (!shortName.empty()) {
-                    nameStr = String(shortName.c_str());
-                }
-            }
-            if (nameStr.length() == 0) {
-                String known = lookupKnownDeviceName(addrStr);
-                if (known.length() > 0) {
-                    nameStr = known;
-                }
-            }
-            if (nameStr.length() == 0) {
-                nameStr = addrStr;
-            }
-            if (nameStr != addrStr) {
-                updateKnownDeviceName(addrStr, nameStr);
-            }
-
-            bool exists = false;
-            for (auto& existing : _devices) {
-                if (existing.id == addrStr) {
-                    exists = true;
-                    if (existing.name == existing.id && nameStr != addrStr) {
-                        existing.name = nameStr;
-                    }
-                    existing.addrType = addrType;
-                    break;
-                }
-            }
-            if (!exists) {
-                MeshDeviceInfo info;
-                info.name = nameStr;
-                info.id   = addrStr;
-                info.addrType = addrType;
-                _devices.push_back(info);
-            }
+        ScanObservation observation;
+        bool changed = false;
+        while (popScanObservation(observation)) {
+            changed = ingestScanObservation(observation.address,
+                                            observation.name,
+                                            observation.addrType) || changed;
         }
+        if (changed && _scanResultsCb) {
+            _scanResultsCb();
+        }
+        Serial.printf("[Mesh] Scan done, Meshtastic devices=%u\n", (unsigned)_devices.size());
 
         pScan->clearResults();
         totalFound = (int)_devices.size();
@@ -429,13 +542,196 @@ String MeshtasticClient::lookupKnownDeviceName(const String& id) const {
     return String();
 }
 
+void MeshtasticClient::loadConnectionPreferences() {
+    Preferences prefs;
+    if (!prefs.begin("cardtastic", true)) {
+        Serial.println("[Mesh] Could not open connection preferences");
+        return;
+    }
+    _autoConnectEnabled = prefs.getBool("autoConnect", true);
+    _lastDeviceAddress = prefs.getString("lastAddress", "");
+    _lastDeviceName = prefs.getString("lastName", "");
+    _lastDeviceAddrType = prefs.getUChar("addrType", BLE_ADDR_PUBLIC);
+    prefs.end();
+
+    Serial.printf("[Mesh] Auto-connect %s; saved device='%s' addr=%s type=%u\n",
+                  _autoConnectEnabled ? "enabled" : "disabled",
+                  _lastDeviceName.c_str(),
+                  _lastDeviceAddress.c_str(),
+                  (unsigned)_lastDeviceAddrType);
+}
+
+void MeshtasticClient::saveAutoConnectPreference() {
+    Preferences prefs;
+    if (!prefs.begin("cardtastic", false)) {
+        Serial.println("[Mesh] Could not save auto-connect preference");
+        return;
+    }
+    prefs.putBool("autoConnect", _autoConnectEnabled);
+    prefs.end();
+}
+
+void MeshtasticClient::toggleAutoConnect() {
+    _autoConnectEnabled = !_autoConnectEnabled;
+    saveAutoConnectPreference();
+    if (!_autoConnectEnabled) {
+        cancelAutoConnectRetries();
+    }
+    Serial.printf("[Mesh] Auto-connect %s\n", _autoConnectEnabled ? "enabled" : "disabled");
+}
+
+bool MeshtasticClient::connectToLastDevice() {
+    if (!_autoConnectEnabled || _lastDeviceAddress.length() == 0) {
+        Serial.println("[Mesh] Auto-connect skipped (disabled or no saved device)");
+        return false;
+    }
+
+    MeshDeviceInfo info;
+    info.name = _lastDeviceName.length() > 0 ? _lastDeviceName : _lastDeviceAddress;
+    info.id = _lastDeviceAddress;
+    info.addrType = _lastDeviceAddrType;
+    _devices.clear();
+    _devices.push_back(info);
+
+    _autoConnectStartup = true;
+    _autoConnectRetryPending = false;
+    _autoConnectAttempts = 0;
+    _autoConnectAttemptStartedMs = 0;
+    _nextAutoConnectAttemptMs = millis();
+    return attemptAutoConnect();
+}
+
+bool MeshtasticClient::attemptAutoConnect() {
+    if (!_autoConnectStartup || !_autoConnectEnabled || _devices.empty()) return false;
+    if (_autoConnectAttempts >= kMaxAutoConnectAttempts) {
+        _autoConnectStartup = false;
+        _autoConnectRetryPending = false;
+        Serial.println("[Mesh] Auto-connect retries exhausted; manual connection remains available");
+        return false;
+    }
+
+    ++_autoConnectAttempts;
+    _autoConnectRetryPending = false;
+    _autoConnectAttemptStartedMs = millis();
+    const MeshDeviceInfo& info = _devices[0];
+    Serial.printf("[Mesh] Auto-connect attempt %u/%u: '%s' (%s, type=%u)\n",
+                  (unsigned)_autoConnectAttempts,
+                  (unsigned)kMaxAutoConnectAttempts,
+                  info.name.c_str(),
+                  info.id.c_str(),
+                  (unsigned)info.addrType);
+
+    bool ok = connectToIndex(0);
+    if (!ok) {
+        scheduleAutoConnectRetry("connect start failed");
+    }
+    return ok;
+}
+
+void MeshtasticClient::scheduleAutoConnectRetry(const char* reason) {
+    if (!_autoConnectStartup || !_autoConnectEnabled || _autoConnectRetryPending) return;
+    if (_autoConnectAttempts >= kMaxAutoConnectAttempts) {
+        _autoConnectStartup = false;
+        Serial.printf("[Mesh] Auto-connect stopped after %u attempts (%s); manual connection remains available\n",
+                      (unsigned)_autoConnectAttempts,
+                      reason ? reason : "unknown error");
+        return;
+    }
+
+    uint8_t delayIndex = _autoConnectAttempts > 0 ? _autoConnectAttempts - 1 : 0;
+    if (delayIndex >= (sizeof(kAutoConnectRetryDelaysMs) / sizeof(kAutoConnectRetryDelaysMs[0]))) {
+        delayIndex = (sizeof(kAutoConnectRetryDelaysMs) / sizeof(kAutoConnectRetryDelaysMs[0])) - 1;
+    }
+    uint32_t delayMs = kAutoConnectRetryDelaysMs[delayIndex];
+    _autoConnectRetryPending = true;
+    _nextAutoConnectAttemptMs = millis() + delayMs;
+    Serial.printf("[Mesh] Auto-connect retry in %lu ms (%s)\n",
+                  (unsigned long)delayMs,
+                  reason ? reason : "connection failed");
+}
+
+void MeshtasticClient::processAutoConnectRetries(uint32_t now) {
+    if (!_autoConnectStartup || !_autoConnectEnabled) return;
+    if (_awaitingPasskey) return;
+
+    if (_autoConnectRetryPending) {
+        if (now >= _nextAutoConnectAttemptMs) {
+            attemptAutoConnect();
+        }
+        return;
+    }
+
+    bool stillConnecting = (_status == ConnectionStatus::CONNECTING) ||
+                           (_status == ConnectionStatus::CONNECTED && _needsServiceDiscovery);
+    if (!stillConnecting || (now - _autoConnectAttemptStartedMs) < kAutoConnectAttemptTimeoutMs) {
+        return;
+    }
+
+    Serial.println("[Mesh] Auto-connect attempt timed out");
+    if (_client) {
+        if (_client->isConnected()) {
+            _client->disconnect();
+        } else {
+            _client->cancelConnect();
+        }
+    }
+    resetConnectionState(false);
+    _status = ConnectionStatus::ERROR;
+    _lastError = "Auto-connect timeout";
+    scheduleAutoConnectRetry("attempt timeout");
+}
+
+void MeshtasticClient::cancelAutoConnectRetries() {
+    _autoConnectStartup = false;
+    _autoConnectRetryPending = false;
+}
+
+void MeshtasticClient::saveLastConnectedDevice() {
+    if (_connectedIndex < 0 || _connectedIndex >= (int)_devices.size()) return;
+
+    const MeshDeviceInfo& info = _devices[_connectedIndex];
+    if (_lastDeviceAddress != info.id) {
+        _lastDeviceName = "";
+    }
+    _lastDeviceAddress = info.id;
+    _lastDeviceAddrType = info.addrType;
+    if (info.name.length() > 0 && info.name != info.id) {
+        _lastDeviceName = info.name;
+    }
+
+    Preferences prefs;
+    if (!prefs.begin("cardtastic", false)) {
+        Serial.println("[Mesh] Could not save last connected device");
+        return;
+    }
+    prefs.putString("lastAddress", _lastDeviceAddress);
+    prefs.putString("lastName", _lastDeviceName);
+    prefs.putUChar("addrType", _lastDeviceAddrType);
+    prefs.end();
+
+    Serial.printf("[Mesh] Saved last device '%s' (%s, type=%u)\n",
+                  _lastDeviceName.c_str(),
+                  _lastDeviceAddress.c_str(),
+                  (unsigned)_lastDeviceAddrType);
+}
+
 void MeshtasticClient::updateKnownDeviceName(const String& id, const String& name) {
     if (name.length() == 0 || name == id) {
         return;
     }
     for (auto& dev : _knownDevices) {
         if (dev.id == id) {
-            dev.name = name;
+            if (dev.name != name) {
+                dev.name = name;
+            }
+            if (id == _lastDeviceAddress && _lastDeviceName != name) {
+                _lastDeviceName = name;
+                Preferences prefs;
+                if (prefs.begin("cardtastic", false)) {
+                    prefs.putString("lastName", _lastDeviceName);
+                    prefs.end();
+                }
+            }
             return;
         }
     }
@@ -443,6 +739,15 @@ void MeshtasticClient::updateKnownDeviceName(const String& id, const String& nam
     info.id = id;
     info.name = name;
     _knownDevices.push_back(info);
+
+    if (id == _lastDeviceAddress && _lastDeviceName != name) {
+        _lastDeviceName = name;
+        Preferences prefs;
+        if (prefs.begin("cardtastic", false)) {
+            prefs.putString("lastName", _lastDeviceName);
+            prefs.end();
+        }
+    }
 }
 
 void MeshtasticClient::resetConnectionState(bool clearNodes) {
@@ -696,13 +1001,19 @@ void MeshtasticClient::disconnect() {
 void MeshtasticClient::handleDisconnect(int reason) {
     bool wasAuthFailed = _authFailed;
     String priorError = _lastError;
+    bool shouldRetryAutoConnect = _autoConnectStartup && !wasAuthFailed;
     resetConnectionState(false);
     if (wasAuthFailed) {
+        _autoConnectStartup = false;
+        _autoConnectRetryPending = false;
         _authFailed = true;
         _status = ConnectionStatus::ERROR;
         _lastError = priorError.length() > 0 ? priorError : "Auth failed";
     } else {
         _lastError = String("Disconnected (") + reason + ")";
+        if (shouldRetryAutoConnect) {
+            scheduleAutoConnectRetry("BLE disconnected during startup");
+        }
     }
 }
 
@@ -711,6 +1022,7 @@ void MeshtasticClient::handleConnect(NimBLEClient* pClient) {
         _status = ConnectionStatus::ERROR;
         _lastError = "Connect failed";
         _pendingConnectIndex = -1;
+        scheduleAutoConnectRetry("invalid connect callback");
         return;
     }
 
@@ -749,12 +1061,15 @@ void MeshtasticClient::handleConnectFail(NimBLEClient* pClient, int reason) {
     _awaitingPasskey      = false;
     _pendingPasskeyHandle = 0xFFFF;
     _needsServiceDiscovery = false;
+    scheduleAutoConnectRetry("BLE connection failed");
 }
 
 void MeshtasticClient::handleAuthComplete(const NimBLEConnInfo& connInfo) {
     _awaitingPasskey = false;
     if (!connInfo.isEncrypted()) {
         _authFailed = true;
+        _autoConnectStartup = false;
+        _autoConnectRetryPending = false;
         _status = ConnectionStatus::ERROR;
         _lastError = "Auth failed";
         if (_client && _client->isConnected()) {
