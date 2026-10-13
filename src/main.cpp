@@ -115,10 +115,20 @@ void drawSplashScreen() {
     }
 }
 
+enum class MessageDeliveryState {
+    UNKNOWN,
+    PENDING,
+    MESH_CONFIRMED,
+    DELIVERED,
+    FAILED
+};
+
 struct Message {
     bool   fromMe;  // true = this UI, false = remote node
     uint32_t from;
     String text;
+    MessageDeliveryState delivery = MessageDeliveryState::UNKNOWN;
+    uint32_t deliveryToken = 0;
 };
 
 struct Conversation {
@@ -135,6 +145,7 @@ static std::vector<Conversation> gConversations;
 static int gActiveConversation = -1;
 static int gSelectedNodeIndex = -1;
 static uint32_t gNextActivitySeq = 1;
+static uint32_t gNextDeliveryToken = 1;
 
 constexpr uint32_t kNodeActiveMs = 5UL * 60UL * 1000UL;
 static bool gSdReady = false;
@@ -598,11 +609,19 @@ void appendConversationMessage(int convIndex,
                                bool fromMe,
                                const String& text,
                                uint32_t from,
-                               bool markUnread) {
+                               bool markUnread,
+                               MessageDeliveryState delivery = MessageDeliveryState::UNKNOWN,
+                               uint32_t deliveryToken = 0) {
     Conversation* conv = getConversation(convIndex);
     if (!conv) return;
     bool autoBottom = (conv->firstVisibleIndex < 0);
-    conv->messages.push_back({fromMe, from, text});
+    Message msg;
+    msg.fromMe = fromMe;
+    msg.from = from;
+    msg.text = text;
+    msg.delivery = delivery;
+    msg.deliveryToken = deliveryToken;
+    conv->messages.push_back(msg);
     if (conv->messages.size() > kConversationMaxMessages) {
         size_t remove = conv->messages.size() - kConversationMaxMessages;
         conv->messages.erase(conv->messages.begin(), conv->messages.begin() + remove);
@@ -615,6 +634,30 @@ void appendConversationMessage(int convIndex,
     }
     conv->lastActivitySeq = gNextActivitySeq++;
     persistConversation(convIndex);
+}
+
+void applyDeliveryUpdate(const MeshDeliveryUpdate& update) {
+    MessageDeliveryState state = MessageDeliveryState::UNKNOWN;
+    switch (update.stage) {
+    case MeshDeliveryStage::MESH_CONFIRMED:
+        state = MessageDeliveryState::MESH_CONFIRMED;
+        break;
+    case MeshDeliveryStage::DESTINATION_ACKED:
+        state = MessageDeliveryState::DELIVERED;
+        break;
+    case MeshDeliveryStage::FAILED:
+        state = MessageDeliveryState::FAILED;
+        break;
+    }
+
+    for (auto& conv : gConversations) {
+        for (auto& msg : conv.messages) {
+            if (msg.deliveryToken == update.token) {
+                msg.delivery = state;
+                return;
+            }
+        }
+    }
 }
 
 // -------------------- Generic list menu helper --------------------
@@ -1753,6 +1796,12 @@ private:
 // -------------------- Chat screen (conversation view) --------------------
 
 class ChatScreen : public Screen {
+    struct ChatLine {
+        String text;
+        size_t coloredPrefixLength = 0;
+        uint16_t prefixColor = WHITE;
+    };
+
 public:
     ChatScreen() : inputBuffer("") {}
 
@@ -1786,7 +1835,7 @@ public:
         int maxRows = (bottomY - topY) / lineH;
         if (maxRows < 1) maxRows = 1;
 
-        std::vector<String> lines;
+        std::vector<ChatLine> lines;
         buildWrappedLines(*conv, d, lines);
         int total    = (int)lines.size();
         int maxStart = (total > maxRows) ? (total - maxRows) : 0;
@@ -1821,11 +1870,23 @@ public:
                                               true,
                                               String("[not connected] ") + inputBuffer,
                                               gMesh.myNodeNum(),
-                                              false);
+                                              false,
+                                              MessageDeliveryState::FAILED);
                 } else {
-                    bool sent = gMesh.sendTextMessage(inputBuffer, dest, conv->channel);
+                    uint32_t deliveryToken = gNextDeliveryToken++;
+                    if (deliveryToken == 0) deliveryToken = gNextDeliveryToken++;
+                    bool sent = gMesh.sendTextMessage(inputBuffer,
+                                                      dest,
+                                                      conv->channel,
+                                                      deliveryToken);
                     if (sent) {
-                        appendConversationMessage(gActiveConversation, true, inputBuffer, gMesh.myNodeNum(), false);
+                        appendConversationMessage(gActiveConversation,
+                                                  true,
+                                                  inputBuffer,
+                                                  gMesh.myNodeNum(),
+                                                  false,
+                                                  MessageDeliveryState::PENDING,
+                                                  deliveryToken);
                         if (!conv->isBroadcast && dest != 0) {
                             gMesh.noteNode(dest);
                         }
@@ -1834,7 +1895,8 @@ public:
                                                   true,
                                                   String("[send failed] ") + inputBuffer,
                                                   gMesh.myNodeNum(),
-                                                  false);
+                                                  false,
+                                                  MessageDeliveryState::FAILED);
                     }
                 }
 
@@ -1900,7 +1962,7 @@ public:
             return;
         }
 
-        std::vector<String> lines;
+        std::vector<ChatLine> lines;
         buildWrappedLines(*conv, d, lines);
         int total    = (int)lines.size();
         int maxStart = (total > maxRows) ? (total - maxRows) : 0;
@@ -1917,7 +1979,16 @@ public:
         int y = topY;
         for (int i = start; i < end; ++i) {
             d.setCursor(2, y);
-            d.println(lines[i]);
+            const ChatLine& line = lines[i];
+            if (line.coloredPrefixLength > 0 && line.coloredPrefixLength <= line.text.length()) {
+                d.setTextColor(line.prefixColor, kColorBodyBg);
+                d.print(line.text.substring(0, line.coloredPrefixLength));
+                d.setTextColor(kColorBodyText, kColorBodyBg);
+                d.println(line.text.substring(line.coloredPrefixLength));
+            } else {
+                d.setTextColor(kColorBodyText, kColorBodyBg);
+                d.println(line.text);
+            }
             y += lineH;
         }
 
@@ -1964,11 +2035,23 @@ private:
                            const String& text,
                            int maxWidth,
                            M5GFX& d,
-                           std::vector<String>& out) const {
+                           size_t coloredPrefixLength,
+                           uint16_t prefixColor,
+                           std::vector<ChatLine>& out) const {
         String effectivePrefix = prefix;
         if (d.textWidth(effectivePrefix) > maxWidth) {
             effectivePrefix = truncateToWidth(effectivePrefix, maxWidth, d);
         }
+        size_t firstOutputLine = out.size();
+        auto appendLine = [&](const String& value) {
+            ChatLine line;
+            line.text = value;
+            if (out.size() == firstOutputLine && coloredPrefixLength > 0) {
+                line.coloredPrefixLength = std::min(coloredPrefixLength, effectivePrefix.length());
+                line.prefixColor = prefixColor;
+            }
+            out.push_back(line);
+        };
         int prefixWidth = d.textWidth(effectivePrefix);
         String indent = makeIndent(prefixWidth, d);
 
@@ -2011,7 +2094,7 @@ private:
             }
 
             if (hasText) {
-                out.push_back(current);
+                appendLine(current);
                 current = indent;
                 currentWidth = d.textWidth(current);
                 hasText = false;
@@ -2041,7 +2124,7 @@ private:
                         pos += 1;
                     }
                     if (pos < wlen) {
-                        out.push_back(current);
+                        appendLine(current);
                         current = indent;
                         currentWidth = d.textWidth(current);
                         hasText = false;
@@ -2055,22 +2138,50 @@ private:
         }
 
         if (wordCount == 0) {
-            out.push_back(effectivePrefix);
+            appendLine(effectivePrefix);
         } else if (hasText) {
-            out.push_back(current);
+            appendLine(current);
         }
     }
 
     void buildWrappedLines(const Conversation& conv,
                            M5GFX& d,
-                           std::vector<String>& out) const {
+                           std::vector<ChatLine>& out) const {
         out.clear();
         d.setTextSize(1);
         int maxWidth = d.width() - 4;
         for (const auto& msg : conv.messages) {
             String label = msg.fromMe ? String("Me") : gMesh.nodeLabel(msg.from);
             String prefix = label + "> ";
-            appendWrappedText(prefix, msg.text, maxWidth, d, out);
+            size_t coloredPrefixLength = msg.fromMe ? 3 : 0;
+            uint16_t prefixColor = kColorBodyText;
+            if (msg.fromMe) {
+                switch (msg.delivery) {
+                case MessageDeliveryState::PENDING:
+                    prefixColor = YELLOW;
+                    break;
+                case MessageDeliveryState::MESH_CONFIRMED:
+                    prefixColor = conv.isBroadcast ? GREEN : CYAN;
+                    break;
+                case MessageDeliveryState::DELIVERED:
+                    prefixColor = GREEN;
+                    break;
+                case MessageDeliveryState::FAILED:
+                    prefixColor = RED;
+                    break;
+                case MessageDeliveryState::UNKNOWN:
+                default:
+                    coloredPrefixLength = 0;
+                    break;
+                }
+            }
+            appendWrappedText(prefix,
+                              msg.text,
+                              maxWidth,
+                              d,
+                              coloredPrefixLength,
+                              prefixColor,
+                              out);
         }
     }
 
@@ -2233,6 +2344,12 @@ void ScreenManager::loop() {
     }
 
     if (tryLoadConversationsOnce()) {
+        needRedraw = true;
+    }
+
+    MeshDeliveryUpdate deliveryUpdate;
+    while (gMesh.popDeliveryUpdate(deliveryUpdate)) {
+        applyDeliveryUpdate(deliveryUpdate);
         needRedraw = true;
     }
 

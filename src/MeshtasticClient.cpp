@@ -71,6 +71,9 @@ MeshtasticClient::MeshtasticClient()
       _nextPacketId(1),
       _lastPollMs(0),
       _lastFromNum(0),
+      _awaitingQueueStatus(),
+      _pendingDeliveries(),
+      _deliveryUpdates(),
       _client(nullptr),
       _scanProgressCb(nullptr),
       _svc(nullptr),
@@ -112,6 +115,9 @@ void MeshtasticClient::begin() {
     _lastPollMs     = 0;
     _lastFromNum    = 0;
     _rxTextQueue.clear();
+    _awaitingQueueStatus.clear();
+    _pendingDeliveries.clear();
+    _deliveryUpdates.clear();
     _devices.clear();
     _nodes.clear();
     _channels.clear();
@@ -127,13 +133,16 @@ void MeshtasticClient::begin() {
 }
 
 void MeshtasticClient::loop() {
-    if (!_client || !_client->isConnected()) return;
-
-    if (_awaitingPasskey) {
+    uint32_t now = millis();
+    if (!_client || !_client->isConnected()) {
+        expirePendingDeliveries(now);
         return;
     }
 
-    uint32_t now = millis();
+    if (_awaitingPasskey) {
+        expirePendingDeliveries(now);
+        return;
+    }
 
     if (_needsServiceDiscovery) {
         NimBLEConnInfo info = _client->getConnInfo();
@@ -186,6 +195,8 @@ void MeshtasticClient::loop() {
         pullFromRadioUntilEmpty(false);
         _lastPollMs = now;
     }
+
+    expirePendingDeliveries(millis());
 }
 
 // ---- Scan and devices ----
@@ -761,6 +772,124 @@ bool MeshtasticClient::popTextMessage(MeshTextMessage& out) {
     return true;
 }
 
+bool MeshtasticClient::popDeliveryUpdate(MeshDeliveryUpdate& out) {
+    if (_deliveryUpdates.empty()) return false;
+    out = _deliveryUpdates.front();
+    _deliveryUpdates.pop_front();
+    return true;
+}
+
+void MeshtasticClient::handleQueueStatus(uint32_t packetId, int result) {
+    if (packetId == 0) return;
+
+    auto pending = _pendingDeliveries.end();
+    for (auto it = _pendingDeliveries.begin(); it != _pendingDeliveries.end(); ++it) {
+        if (it->packetId == packetId) {
+            pending = it;
+            break;
+        }
+    }
+
+    if (pending == _pendingDeliveries.end()) {
+        while (!_awaitingQueueStatus.empty()) {
+            uint32_t token = _awaitingQueueStatus.front();
+            _awaitingQueueStatus.pop_front();
+            for (auto it = _pendingDeliveries.begin(); it != _pendingDeliveries.end(); ++it) {
+                if (it->token == token && it->packetId == 0) {
+                    it->packetId = packetId;
+                    pending = it;
+                    break;
+                }
+            }
+            if (pending != _pendingDeliveries.end()) break;
+        }
+    }
+
+    if (pending == _pendingDeliveries.end()) return;
+
+    Serial.printf("[Mesh] Delivery tracking: token=%lu packet_id=%lu queue_result=%d\n",
+                  (unsigned long)pending->token,
+                  (unsigned long)packetId,
+                  result);
+    if (result != 0) {
+        finishDelivery(pending->token, MeshDeliveryStage::FAILED);
+    }
+}
+
+void MeshtasticClient::handleRoutingResult(uint32_t packetId,
+                                            uint32_t from,
+                                            uint32_t to,
+                                            bool hasError,
+                                            int errorReason) {
+    if (packetId == 0) return;
+
+    for (auto it = _pendingDeliveries.begin(); it != _pendingDeliveries.end(); ++it) {
+        if (it->packetId != packetId) continue;
+
+        if (hasError && errorReason != meshtastic_Routing_Error_NONE) {
+            Serial.printf("[Mesh] Delivery failed: token=%lu packet_id=%lu reason=%d\n",
+                          (unsigned long)it->token,
+                          (unsigned long)packetId,
+                          errorReason);
+            finishDelivery(it->token, MeshDeliveryStage::FAILED);
+            return;
+        }
+
+        if (from == _myNodeNum && to == _myNodeNum) {
+            Serial.printf("[Mesh] Mesh relay confirmed: token=%lu packet_id=%lu\n",
+                          (unsigned long)it->token,
+                          (unsigned long)packetId);
+            _deliveryUpdates.push_back({it->token, MeshDeliveryStage::MESH_CONFIRMED});
+            if (it->destination == 0xFFFFFFFF) {
+                _pendingDeliveries.erase(it);
+            }
+            return;
+        }
+
+        if (it->destination != 0xFFFFFFFF && from == it->destination) {
+            Serial.printf("[Mesh] Destination ACK: token=%lu packet_id=%lu from=0x%08lX\n",
+                          (unsigned long)it->token,
+                          (unsigned long)packetId,
+                          (unsigned long)from);
+            finishDelivery(it->token, MeshDeliveryStage::DESTINATION_ACKED);
+            return;
+        }
+    }
+}
+
+void MeshtasticClient::finishDelivery(uint32_t token, MeshDeliveryStage stage) {
+    _deliveryUpdates.push_back({token, stage});
+    for (auto it = _pendingDeliveries.begin(); it != _pendingDeliveries.end(); ++it) {
+        if (it->token == token) {
+            _pendingDeliveries.erase(it);
+            break;
+        }
+    }
+    for (auto it = _awaitingQueueStatus.begin(); it != _awaitingQueueStatus.end();) {
+        if (*it == token) {
+            it = _awaitingQueueStatus.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void MeshtasticClient::expirePendingDeliveries(uint32_t now) {
+    constexpr uint32_t kDeliveryTimeoutMs = 90000;
+    for (size_t i = 0; i < _pendingDeliveries.size();) {
+        if (now - _pendingDeliveries[i].startedMs < kDeliveryTimeoutMs) {
+            ++i;
+            continue;
+        }
+        uint32_t token = _pendingDeliveries[i].token;
+        Serial.printf("[Mesh] Delivery timeout: token=%lu packet_id=%lu\n",
+                      (unsigned long)token,
+                      (unsigned long)_pendingDeliveries[i].packetId);
+        finishDelivery(token, MeshDeliveryStage::FAILED);
+        i = 0;
+    }
+}
+
 String MeshtasticClient::nodeLabel(uint32_t nodeNum) const {
     if (nodeNum == 0) return String("Node");
     for (const auto& node : _nodes) {
@@ -835,7 +964,10 @@ bool MeshtasticClient::requestConfig() {
     return ok;
 }
 
-bool MeshtasticClient::sendTextMessage(const String& text, uint32_t dest, uint8_t channel) {
+bool MeshtasticClient::sendTextMessage(const String& text,
+                                       uint32_t dest,
+                                       uint8_t channel,
+                                       uint32_t deliveryToken) {
     if (text.length() == 0) {
         _lastError = "Empty message";
         return false;
@@ -891,6 +1023,15 @@ bool MeshtasticClient::sendTextMessage(const String& text, uint32_t dest, uint8_
     }
 
     bool ok = writeToRadio(buf, stream.bytes_written, "Send");
+    if (ok && deliveryToken != 0) {
+        PendingDelivery pending;
+        pending.token = deliveryToken;
+        pending.packetId = 0;
+        pending.destination = dest;
+        pending.startedMs = millis();
+        _pendingDeliveries.push_back(pending);
+        _awaitingQueueStatus.push_back(deliveryToken);
+    }
     Serial.printf("[Mesh] Send text len=%u -> %s\n",
                   (unsigned)len,
                   ok ? "ok" : "fail");
@@ -1018,6 +1159,7 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
                       (unsigned)fr.queueStatus.maxlen,
                       (unsigned long)fr.queueStatus.mesh_packet_id,
                       (unsigned long)fr.queueStatus.mesh_packet_id);
+        handleQueueStatus(fr.queueStatus.mesh_packet_id, (int)fr.queueStatus.res);
         return true;
     }
 
@@ -1113,6 +1255,8 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
             Serial.printf("[Mesh] Routing packet without payload: request_id=%lu reply_id=%lu\n",
                           (unsigned long)decoded.request_id,
                           (unsigned long)decoded.reply_id);
+            handleRoutingResult(decoded.request_id, pkt.from, pkt.to, false,
+                                meshtastic_Routing_Error_NONE);
         } else {
             meshtastic_Routing routing = meshtastic_Routing_init_zero;
             pb_istream_t routingStream = pb_istream_from_buffer(decoded.payload.bytes,
@@ -1127,6 +1271,11 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
                                       (unsigned long)decoded.request_id,
                                       (int)routing.error_reason);
                     }
+                    handleRoutingResult(decoded.request_id,
+                                        pkt.from,
+                                        pkt.to,
+                                        true,
+                                        (int)routing.error_reason);
                 } else {
                     Serial.printf("[Mesh] Routing message: request_id=%lu variant=%u\n",
                                   (unsigned long)decoded.request_id,

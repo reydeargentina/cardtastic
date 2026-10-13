@@ -49,6 +49,17 @@ struct MeshTextMessage {
     String   text;
 };
 
+enum class MeshDeliveryStage {
+    MESH_CONFIRMED,
+    DESTINATION_ACKED,
+    FAILED
+};
+
+struct MeshDeliveryUpdate {
+    uint32_t token;
+    MeshDeliveryStage stage;
+};
+
 // Known channel info (from node config)
 struct MeshChannelInfo {
     int8_t   index = -1;
@@ -107,12 +118,16 @@ public:
 
     // ---- Incoming messages (text) ----
     bool     popTextMessage(MeshTextMessage& out);
+    bool     popDeliveryUpdate(MeshDeliveryUpdate& out);
     uint32_t myNodeNum() const { return _myNodeNum; }
     String   nodeLabel(uint32_t nodeNum) const;
 
     // ---- Outgoing messages ----
     bool requestConfig();
-    bool sendTextMessage(const String& text, uint32_t dest = 0xFFFFFFFF, uint8_t channel = 0);
+    bool sendTextMessage(const String& text,
+                         uint32_t dest = 0xFFFFFFFF,
+                         uint8_t channel = 0,
+                         uint32_t deliveryToken = 0);
     void setPasskey(uint32_t passkey);
     void clearPasskey();
     bool submitPasskey(uint32_t passkey);
@@ -128,6 +143,14 @@ private:
     void resetConnectionState(bool clearNodes);
     String lookupKnownDeviceName(const String& id) const;
     void updateKnownDeviceName(const String& id, const String& name);
+    void handleQueueStatus(uint32_t packetId, int result);
+    void handleRoutingResult(uint32_t packetId,
+                            uint32_t from,
+                            uint32_t to,
+                            bool hasError,
+                            int errorReason);
+    void finishDelivery(uint32_t token, MeshDeliveryStage stage);
+    void expirePendingDeliveries(uint32_t now);
     void handleFromNumNotify(NimBLERemoteCharacteristic* chr,
                              uint8_t* data, size_t len, bool isNotify);
     void handleLogNotify(NimBLERemoteCharacteristic* chr,
@@ -156,6 +179,15 @@ private:
     uint32_t                    _lastPollMs;
     uint32_t                    _lastFromNum;
     std::deque<MeshTextMessage> _rxTextQueue;
+    struct PendingDelivery {
+        uint32_t token;
+        uint32_t packetId;
+        uint32_t destination;
+        uint32_t startedMs;
+    };
+    std::deque<uint32_t>        _awaitingQueueStatus;
+    std::vector<PendingDelivery> _pendingDeliveries;
+    std::deque<MeshDeliveryUpdate> _deliveryUpdates;
     std::vector<MeshDeviceInfo> _devices;
     std::vector<MeshDeviceInfo> _knownDevices;
     std::vector<MeshNodeInfo>   _nodes;
