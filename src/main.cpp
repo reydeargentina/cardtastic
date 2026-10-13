@@ -1792,24 +1792,23 @@ public:
         int maxStart = (total > maxRows) ? (total - maxRows) : 0;
         int step     = (k == NavKey::UP_FAST || k == NavKey::DOWN_FAST) ? maxRows : 1;
 
-        if (conv->firstVisibleIndex < 0) {
-            conv->firstVisibleIndex = maxStart;
-        }
+        int currentStart = conv->firstVisibleIndex < 0 ? maxStart : conv->firstVisibleIndex;
 
         switch (k) {
         case NavKey::UP:
         case NavKey::UP_FAST:
-            if (conv->firstVisibleIndex > 0) {
-                conv->firstVisibleIndex -= step;
-                if (conv->firstVisibleIndex < 0) conv->firstVisibleIndex = 0;
-            }
+            currentStart -= step;
+            if (currentStart < 0) currentStart = 0;
+            conv->firstVisibleIndex = currentStart;
             break;
 
         case NavKey::DOWN:
         case NavKey::DOWN_FAST:
-            if (conv->firstVisibleIndex < maxStart) {
-                conv->firstVisibleIndex += step;
-                if (conv->firstVisibleIndex > maxStart) conv->firstVisibleIndex = maxStart;
+            currentStart += step;
+            if (currentStart >= maxStart) {
+                conv->firstVisibleIndex = -1;
+            } else {
+                conv->firstVisibleIndex = currentStart;
             }
             break;
 
@@ -1906,17 +1905,9 @@ public:
         int total    = (int)lines.size();
         int maxStart = (total > maxRows) ? (total - maxRows) : 0;
 
-        if (conv->firstVisibleIndex < 0) {
-            conv->firstVisibleIndex = maxStart;
-        }
-        if (conv->firstVisibleIndex > maxStart) {
-            conv->firstVisibleIndex = maxStart;
-        }
-        if (conv->firstVisibleIndex < 0) {
-            conv->firstVisibleIndex = 0;
-        }
-
-        int start = conv->firstVisibleIndex;
+        int start = conv->firstVisibleIndex < 0 ? maxStart : conv->firstVisibleIndex;
+        if (start > maxStart) start = maxStart;
+        if (start < 0) start = 0;
         int end   = start + maxRows;
         if (end > total) end = total;
 
@@ -2253,6 +2244,13 @@ void ScreenManager::loop() {
         int convIndex = ensureConversation(peer, isBroadcast, msg.channel);
         bool isActive = (convIndex == gActiveConversation);
         bool markUnread = (!msg.fromMe && !isActive);
+        Serial.printf("[App] RX route: peer=0x%08lX broadcast=%d ch=%u conv=%d active=%d unread=%d\n",
+                      (unsigned long)peer,
+                      isBroadcast ? 1 : 0,
+                      (unsigned)msg.channel,
+                      convIndex,
+                      isActive ? 1 : 0,
+                      markUnread ? 1 : 0);
         appendConversationMessage(convIndex, msg.fromMe, msg.text, msg.from, markUnread);
         gotMessage = true;
     }

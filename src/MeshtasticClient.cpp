@@ -863,11 +863,24 @@ bool MeshtasticClient::sendTextMessage(const String& text, uint32_t dest, uint8_
     pkt.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
     pkt.decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
     pkt.decoded.want_response = false;
+    // ReliableRouter uses explicit ACKs for DMs and implicit ACK/retries for broadcasts.
+    pkt.want_ack = true;
 
     size_t maxLen = sizeof(pkt.decoded.payload.bytes);
     size_t len = (text.length() > maxLen) ? maxLen : text.length();
     pkt.decoded.payload.size = static_cast<pb_size_t>(len);
     memcpy(pkt.decoded.payload.bytes, text.c_str(), len);
+
+    Serial.printf("[Mesh] TX packet: id=%lu from=0x%08lX to=0x%08lX ch=%u port=%u payload=%u/%u want_ack=%d want_response=%d\n",
+                  (unsigned long)pkt.id,
+                  (unsigned long)pkt.from,
+                  (unsigned long)pkt.to,
+                  (unsigned)pkt.channel,
+                  (unsigned)pkt.decoded.portnum,
+                  (unsigned)pkt.decoded.payload.size,
+                  (unsigned)sizeof(pkt.decoded.payload.bytes),
+                  pkt.want_ack ? 1 : 0,
+                  pkt.decoded.want_response ? 1 : 0);
 
     uint8_t buf[meshtastic_ToRadio_size];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
@@ -969,6 +982,18 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
         return false;
     }
 
+    Serial.printf("[Mesh] FromRadio decoded: variant=%u len=%u\n",
+                  (unsigned)fr.which_payload_variant,
+                  (unsigned)len);
+
+    if (fr.which_payload_variant != meshtastic_FromRadio_packet_tag && len <= 32) {
+        Serial.print("[Mesh] FromRadio raw:");
+        for (size_t i = 0; i < len; ++i) {
+            Serial.printf(" %02X", data[i]);
+        }
+        Serial.println();
+    }
+
     if (fr.which_payload_variant == meshtastic_FromRadio_my_info_tag) {
         _myNodeNum = fr.my_info.my_node_num;
         noteNode(_myNodeNum);
@@ -983,6 +1008,16 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
         if (_lastError.startsWith("Config")) {
             _lastError = "";
         }
+        return true;
+    }
+
+    if (fr.which_payload_variant == meshtastic_FromRadio_queueStatus_tag) {
+        Serial.printf("[Mesh] Queue status: result=%d free=%u/%u mesh_packet_id=0x%08lX (%lu)\n",
+                      (int)fr.queueStatus.res,
+                      (unsigned)fr.queueStatus.free,
+                      (unsigned)fr.queueStatus.maxlen,
+                      (unsigned long)fr.queueStatus.mesh_packet_id,
+                      (unsigned long)fr.queueStatus.mesh_packet_id);
         return true;
     }
 
@@ -1041,7 +1076,11 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
 
     const meshtastic_MeshPacket& pkt = fr.packet;
     if (pkt.which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
-        Serial.printf("[Mesh] Packet not decoded (variant=%u)\n",
+        Serial.printf("[Mesh] Packet not decoded: id=%lu from=0x%08lX to=0x%08lX ch=%u payload_variant=%u\n",
+                      (unsigned long)pkt.id,
+                      (unsigned long)pkt.from,
+                      (unsigned long)pkt.to,
+                      (unsigned)pkt.channel,
                       (unsigned)pkt.which_payload_variant);
         return true;
     }
@@ -1056,12 +1095,49 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
     }
 
     const meshtastic_Data& decoded = pkt.decoded;
-    Serial.printf("[Mesh] Packet from=0x%lX to=0x%lX ch=%u port=%u len=%u\n",
+    Serial.printf("[Mesh] Packet: id=%lu from=0x%08lX to=0x%08lX ch=%u port=%u len=%u request_id=%lu reply_id=%lu rx_snr=%.1f hop_limit=%u want_ack=%d\n",
+                  (unsigned long)pkt.id,
                   (unsigned long)pkt.from,
                   (unsigned long)pkt.to,
                   (unsigned)pkt.channel,
                   (unsigned)decoded.portnum,
-                  (unsigned)decoded.payload.size);
+                  (unsigned)decoded.payload.size,
+                  (unsigned long)decoded.request_id,
+                  (unsigned long)decoded.reply_id,
+                  pkt.rx_snr,
+                  (unsigned)pkt.hop_limit,
+                  pkt.want_ack ? 1 : 0);
+
+    if (decoded.portnum == meshtastic_PortNum_ROUTING_APP) {
+        if (decoded.payload.size == 0) {
+            Serial.printf("[Mesh] Routing packet without payload: request_id=%lu reply_id=%lu\n",
+                          (unsigned long)decoded.request_id,
+                          (unsigned long)decoded.reply_id);
+        } else {
+            meshtastic_Routing routing = meshtastic_Routing_init_zero;
+            pb_istream_t routingStream = pb_istream_from_buffer(decoded.payload.bytes,
+                                                                 decoded.payload.size);
+            if (pb_decode(&routingStream, &meshtastic_Routing_msg, &routing)) {
+                if (routing.which_variant == meshtastic_Routing_error_reason_tag) {
+                    if (routing.error_reason == meshtastic_Routing_Error_NONE) {
+                        Serial.printf("[Mesh] Routing ACK: request_id=%lu result=success\n",
+                                      (unsigned long)decoded.request_id);
+                    } else {
+                        Serial.printf("[Mesh] Routing error: request_id=%lu reason=%d\n",
+                                      (unsigned long)decoded.request_id,
+                                      (int)routing.error_reason);
+                    }
+                } else {
+                    Serial.printf("[Mesh] Routing message: request_id=%lu variant=%u\n",
+                                  (unsigned long)decoded.request_id,
+                                  (unsigned)routing.which_variant);
+                }
+            } else {
+                Serial.printf("[Mesh] Routing payload decode failed: %s\n",
+                              PB_GET_ERROR(&routingStream));
+            }
+        }
+    }
 
     if (decoded.portnum != meshtastic_PortNum_TEXT_MESSAGE_APP) {
         return true;
@@ -1084,6 +1160,12 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
     msg.fromMe = (_myNodeNum != 0 && pkt.from == _myNodeNum);
     msg.text   = text;
 
+    Serial.printf("[Mesh] RX text queued: from=0x%08lX to=0x%08lX ch=%u fromMe=%d len=%u\n",
+                  (unsigned long)msg.from,
+                  (unsigned long)msg.to,
+                  (unsigned)msg.channel,
+                  msg.fromMe ? 1 : 0,
+                  (unsigned)msg.text.length());
     _rxTextQueue.push_back(msg);
     return true;
 }
