@@ -44,6 +44,91 @@ static int gScanSecondsLeft = -1;
 static int gScanAttempt = 0;
 static int gScanAttempts = 0;
 
+uint32_t decodeUtf8Codepoint(const String& text, size_t index, size_t& byteCount) {
+    const size_t length = text.length();
+    if (index >= length) {
+        byteCount = 0;
+        return 0;
+    }
+
+    const uint8_t first = static_cast<uint8_t>(text[index]);
+    if (first < 0x80) {
+        byteCount = 1;
+        return first;
+    }
+
+    uint8_t expected = 0;
+    uint32_t codepoint = 0;
+    if ((first & 0xE0) == 0xC0) {
+        expected = 2;
+        codepoint = first & 0x1F;
+    } else if ((first & 0xF0) == 0xE0) {
+        expected = 3;
+        codepoint = first & 0x0F;
+    } else if ((first & 0xF8) == 0xF0) {
+        expected = 4;
+        codepoint = first & 0x07;
+    } else {
+        byteCount = 1;
+        return 0xFFFD;
+    }
+
+    if (index + expected > length) {
+        byteCount = 1;
+        return 0xFFFD;
+    }
+    for (uint8_t i = 1; i < expected; ++i) {
+        uint8_t continuation = static_cast<uint8_t>(text[index + i]);
+        if ((continuation & 0xC0) != 0x80) {
+            byteCount = 1;
+            return 0xFFFD;
+        }
+        codepoint = (codepoint << 6) | (continuation & 0x3F);
+    }
+
+    if ((expected == 2 && codepoint < 0x80) ||
+        (expected == 3 && codepoint < 0x800) ||
+        (expected == 4 && codepoint < 0x10000) ||
+        codepoint > 0x10FFFF ||
+        (codepoint >= 0xD800 && codepoint <= 0xDFFF)) {
+        byteCount = 1;
+        return 0xFFFD;
+    }
+
+    byteCount = expected;
+    return codepoint;
+}
+
+bool isEmojiCodepoint(uint32_t codepoint) {
+    return (codepoint >= 0x1F000 && codepoint <= 0x1FAFF) ||
+           (codepoint >= 0x2600 && codepoint <= 0x27BF) ||
+           (codepoint >= 0x1F1E6 && codepoint <= 0x1F1FF) ||
+           (codepoint >= 0x1F3FB && codepoint <= 0x1F3FF) ||
+           (codepoint >= 0xFE00 && codepoint <= 0xFE0F) ||
+           (codepoint >= 0xE0020 && codepoint <= 0xE007F) ||
+           codepoint == 0x200D || codepoint == 0x20E3;
+}
+
+String omitEmoji(const String& text) {
+    String result;
+    result.reserve(text.length());
+    for (size_t i = 0; i < text.length();) {
+        size_t byteCount = 0;
+        uint32_t codepoint = decodeUtf8Codepoint(text, i, byteCount);
+        if (!isEmojiCodepoint(codepoint)) {
+            result.concat(text.substring(i, i + byteCount));
+        }
+        i += byteCount;
+    }
+    return result;
+}
+
+size_t nextUtf8Boundary(const String& text, size_t index) {
+    size_t byteCount = 0;
+    decodeUtf8Codepoint(text, index, byteCount);
+    return index + (byteCount > 0 ? byteCount : 1);
+}
+
 void drawHeaderBackground(int height) {
     if (height <= 0) return;
     auto& d = M5Cardputer.Display;
@@ -434,7 +519,7 @@ String conversationListTitle(const Conversation& conv) {
 String lastMessagePreview(const Conversation& conv) {
     if (conv.messages.empty()) return String("");
     const Message& msg = conv.messages.back();
-    String text = msg.text;
+    String text = omitEmoji(msg.text);
     text.replace('\n', ' ');
     if (msg.fromMe) {
         return String("Me: ") + text;
@@ -2030,13 +2115,19 @@ private:
         const String ellipsis = "...";
         int ellipsisW = d.textWidth(ellipsis);
         if (ellipsisW >= maxWidth) return text.substring(0, 1);
-        int len = (int)text.length();
-        while (len > 0) {
-            String sub = text.substring(0, len);
+        size_t end = 0;
+        String sub;
+        while (end < text.length()) {
+            size_t next = nextUtf8Boundary(text, end);
+            String candidate = text.substring(0, next);
+            if (d.textWidth(candidate) + ellipsisW > maxWidth) break;
+            end = next;
+            sub = candidate;
+        }
+        if (end > 0) {
             if (d.textWidth(sub) + ellipsisW <= maxWidth) {
                 return sub + ellipsis;
             }
-            len--;
         }
         return ellipsis;
     }
@@ -2119,29 +2210,27 @@ private:
             }
 
             if (currentWidth + wordWidth > maxWidth) {
-                int pos = 0;
-                int wlen = word.length();
-                while (pos < wlen) {
-                    int chunkLen = wlen - pos;
-                    while (chunkLen > 0) {
-                        String chunk = word.substring(pos, pos + chunkLen);
-                        if (currentWidth + d.textWidth(chunk) <= maxWidth) {
-                            current += chunk;
-                            currentWidth += d.textWidth(chunk);
-                            hasText = true;
-                            pos += chunkLen;
-                            break;
-                        }
-                        chunkLen--;
+                size_t pos = 0;
+                while (pos < word.length()) {
+                    size_t chunkEnd = pos;
+                    String chunk;
+                    while (chunkEnd < word.length()) {
+                        size_t next = nextUtf8Boundary(word, chunkEnd);
+                        String candidate = word.substring(pos, next);
+                        if (chunkEnd > pos && currentWidth + d.textWidth(candidate) > maxWidth) break;
+                        chunkEnd = next;
+                        chunk = candidate;
+                        if (currentWidth + d.textWidth(chunk) > maxWidth) break;
                     }
-                    if (chunkLen == 0) {
-                        String chunk = word.substring(pos, pos + 1);
-                        current += chunk;
-                        currentWidth += d.textWidth(chunk);
-                        hasText = true;
-                        pos += 1;
+                    if (chunkEnd == pos) {
+                        chunkEnd = nextUtf8Boundary(word, pos);
+                        chunk = word.substring(pos, chunkEnd);
                     }
-                    if (pos < wlen) {
+                    current += chunk;
+                    currentWidth += d.textWidth(chunk);
+                    hasText = true;
+                    pos = chunkEnd;
+                    if (pos < word.length()) {
                         appendLine(current);
                         current = indent;
                         currentWidth = d.textWidth(current);
@@ -2193,8 +2282,9 @@ private:
                     break;
                 }
             }
+            String displayText = omitEmoji(msg.text);
             appendWrappedText(prefix,
-                              msg.text,
+                              displayText,
                               maxWidth,
                               d,
                               coloredPrefixLength,
