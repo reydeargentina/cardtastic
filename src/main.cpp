@@ -196,15 +196,7 @@ int hexDigitValue(char c) {
     return c - 'A' + 10;
 }
 
-String knownNodeName(uint32_t nodeNum) {
-    for (int i = 0; i < gMesh.getNodeCount(); ++i) {
-        MeshNodeInfo node = gMesh.getNodeInfo(i);
-        if (node.num != nodeNum) continue;
-        if (node.shortName.length() > 0) return node.shortName;
-        return node.longName;
-    }
-    return String();
-}
+String knownNodeName(uint32_t nodeNum);
 
 String resolveNodeMentionsForDisplay(const String& text) {
     String result;
@@ -395,7 +387,14 @@ struct Conversation {
     uint32_t             lastActivitySeq;
 };
 
+struct CachedNodeIdentity {
+    uint32_t nodeNum = 0;
+    String shortName;
+    String longName;
+};
+
 static std::vector<Conversation> gConversations;
+static std::vector<CachedNodeIdentity> gCachedNodeIdentities;
 static int gActiveConversation = -1;
 static int gSelectedNodeIndex = -1;
 static uint32_t gNextActivitySeq = 1;
@@ -406,6 +405,8 @@ static bool gSdReady = false;
 static uint32_t gLastSdAttemptMs = 0;
 static bool gStorageLoaded = false;
 static uint32_t gLoadedRadioNode = 0;
+static uint32_t gNodeIdentityCacheRadio = 0;
+static bool gNodeIdentityCacheDirty = false;
 static uint32_t gLastInputMs = 0;
 static bool gScreenSleeping = false;
 static int gPendingPinDeviceIndex = -1;
@@ -413,6 +414,7 @@ static int gPendingPinDeviceIndex = -1;
 Conversation* getConversation(int index);
 int ensureConversation(uint32_t peer, bool isBroadcast, uint8_t channel);
 void initConversations();
+String resolvedNodeLabel(uint32_t nodeNum);
 
 bool initStorage() {
     int cs = M5.getPin(m5::sd_spi_cs);
@@ -463,6 +465,147 @@ String nodeHexId(uint32_t num) {
     char buf[9];
     snprintf(buf, sizeof(buf), "%08lX", (unsigned long)num);
     return String(buf);
+}
+
+String nodeIdentityCachePath(uint32_t radioNode) {
+    return String(kStorageDir) + "/nodes_" + nodeHexId(radioNode) + ".json";
+}
+
+bool loadNodeIdentityCache(uint32_t radioNode) {
+    if (radioNode == 0 || gNodeIdentityCacheRadio == radioNode) return false;
+    if (!ensureStorage()) return false;
+
+    gCachedNodeIdentities.clear();
+    gNodeIdentityCacheDirty = false;
+    String path = nodeIdentityCachePath(radioNode);
+    if (SD.exists(path)) {
+        File f = SD.open(path, FILE_READ);
+        if (f) {
+            size_t cap = f.size() * 2 + 512;
+            if (cap < 2048) cap = 2048;
+            if (cap > 49152) cap = 49152;
+            DynamicJsonDocument doc(cap);
+            DeserializationError err = deserializeJson(doc, f);
+            f.close();
+            if (!err && (doc["radio"] | 0UL) == radioNode) {
+                JsonArray nodes = doc["nodes"].as<JsonArray>();
+                for (JsonObject obj : nodes) {
+                    CachedNodeIdentity identity;
+                    identity.nodeNum = obj["num"] | 0UL;
+                    identity.shortName = obj["short"] | "";
+                    identity.longName = obj["long"] | "";
+                    if (identity.nodeNum != 0 &&
+                        (identity.shortName.length() > 0 || identity.longName.length() > 0)) {
+                        gCachedNodeIdentities.push_back(identity);
+                    }
+                }
+            }
+        }
+    }
+
+    gNodeIdentityCacheRadio = radioNode;
+    return true;
+}
+
+bool persistNodeIdentityCache() {
+    uint32_t radioNode = gMesh.myNodeNum();
+    if (radioNode == 0 || radioNode != gNodeIdentityCacheRadio || !ensureStorage()) return false;
+
+    size_t capacity = 2048 + gCachedNodeIdentities.size() * 128;
+    if (capacity > 49152) capacity = 49152;
+    DynamicJsonDocument doc(capacity);
+    doc["version"] = 1;
+    doc["radio"] = radioNode;
+    JsonArray nodes = doc.createNestedArray("nodes");
+    for (const auto& identity : gCachedNodeIdentities) {
+        JsonObject obj = nodes.createNestedObject();
+        obj["num"] = identity.nodeNum;
+        obj["short"] = identity.shortName;
+        obj["long"] = identity.longName;
+    }
+    if (doc.overflowed()) return false;
+
+    String path = nodeIdentityCachePath(radioNode);
+    String tempPath = path + ".tmp";
+    SD.remove(tempPath);
+    File f = SD.open(tempPath, FILE_WRITE);
+    if (!f) return false;
+    serializeJson(doc, f);
+    f.close();
+
+    if (SD.exists(path)) SD.remove(path);
+    if (!SD.rename(tempPath, path)) {
+        SD.remove(tempPath);
+        return false;
+    }
+    return true;
+}
+
+bool refreshNodeIdentityCache() {
+    uint32_t radioNode = gMesh.myNodeNum();
+    if (radioNode == 0 || radioNode != gNodeIdentityCacheRadio) return false;
+
+    bool changed = false;
+    for (int i = 0; i < gMesh.getNodeCount(); ++i) {
+        MeshNodeInfo node = gMesh.getNodeInfo(i);
+        if (node.num == 0 || (node.shortName.length() == 0 && node.longName.length() == 0)) continue;
+
+        CachedNodeIdentity* cached = nullptr;
+        for (auto& identity : gCachedNodeIdentities) {
+            if (identity.nodeNum == node.num) {
+                cached = &identity;
+                break;
+            }
+        }
+        if (!cached) {
+            CachedNodeIdentity identity;
+            identity.nodeNum = node.num;
+            identity.shortName = node.shortName;
+            identity.longName = node.longName;
+            gCachedNodeIdentities.push_back(identity);
+            changed = true;
+            continue;
+        }
+
+        if (node.shortName.length() > 0 && cached->shortName != node.shortName) {
+            cached->shortName = node.shortName;
+            changed = true;
+        }
+        if (node.longName.length() > 0 && cached->longName != node.longName) {
+            cached->longName = node.longName;
+            changed = true;
+        }
+    }
+
+    if (changed) gNodeIdentityCacheDirty = true;
+    if (gNodeIdentityCacheDirty && persistNodeIdentityCache()) {
+        gNodeIdentityCacheDirty = false;
+    }
+    return changed;
+}
+
+String knownNodeName(uint32_t nodeNum) {
+    if (nodeNum == 0) return String();
+    for (int i = 0; i < gMesh.getNodeCount(); ++i) {
+        MeshNodeInfo node = gMesh.getNodeInfo(i);
+        if (node.num != nodeNum) continue;
+        if (node.shortName.length() > 0) return node.shortName;
+        if (node.longName.length() > 0) return node.longName;
+        break;
+    }
+    for (const auto& identity : gCachedNodeIdentities) {
+        if (identity.nodeNum != nodeNum) continue;
+        if (identity.shortName.length() > 0) return identity.shortName;
+        return identity.longName;
+    }
+    return String();
+}
+
+String resolvedNodeLabel(uint32_t nodeNum) {
+    if (nodeNum == 0) return String("Unknown");
+    String name = knownNodeName(nodeNum);
+    if (name.length() > 0) return name;
+    return String("0x") + nodeHexId(nodeNum);
 }
 
 uint32_t parsePeerFromFilename(const String& name) {
@@ -544,7 +687,9 @@ void loadConversationsFromStorage() {
             continue;
         }
         String name = String(f.name());
-        if (!name.endsWith(".json")) {
+        int slash = name.lastIndexOf('/');
+        String baseName = (slash >= 0) ? name.substring(slash + 1) : name;
+        if (!baseName.endsWith(".json") || baseName.startsWith("nodes_")) {
             f.close();
             continue;
         }
@@ -632,6 +777,7 @@ bool tryLoadConversationsOnce() {
         initConversations();
     }
 
+    loadNodeIdentityCache(currentRadio);
     gLoadedRadioNode = currentRadio;
     loadConversationsFromStorage();
     gStorageLoaded = true;
@@ -671,7 +817,7 @@ Conversation* getConversation(int index) {
 
 String conversationTitle(const Conversation& conv) {
     if (conv.isBroadcast) return mapSpanishGlyphsForDisplay(gMesh.channelLabel(conv.channel), true);
-    return mapSpanishGlyphsForDisplay(gMesh.nodeLabel(conv.peer), true);
+    return mapSpanishGlyphsForDisplay(resolvedNodeLabel(conv.peer), true);
 }
 
 String conversationListTitle(const Conversation& conv) {
@@ -679,7 +825,7 @@ String conversationListTitle(const Conversation& conv) {
         return mapSpanishGlyphsForDisplay(String("[ch") + String(conv.channel) + "] " +
                                           gMesh.channelLabel(conv.channel));
     }
-    return mapSpanishGlyphsForDisplay(gMesh.nodeLabel(conv.peer));
+    return mapSpanishGlyphsForDisplay(resolvedNodeLabel(conv.peer));
 }
 
 String lastMessagePreview(const Conversation& conv) {
@@ -2479,7 +2625,7 @@ private:
         d.setTextSize(1);
         int maxWidth = d.width() - 4;
         for (const auto& msg : conv.messages) {
-            String label = msg.fromMe ? String("Me") : gMesh.nodeLabel(msg.from);
+            String label = msg.fromMe ? String("Me") : resolvedNodeLabel(msg.from);
             label = mapSpanishGlyphsForDisplay(label, true);
             String prefix = label + "> ";
             size_t coloredPrefixLength = msg.fromMe ? 3 : 0;
@@ -2690,6 +2836,9 @@ void ScreenManager::loop() {
     if (tryLoadConversationsOnce()) {
         needRedraw = true;
     }
+    if (refreshNodeIdentityCache()) {
+        needRedraw = true;
+    }
 
     MeshDeliveryUpdate deliveryUpdate;
     while (gMesh.popDeliveryUpdate(deliveryUpdate)) {
@@ -2701,18 +2850,26 @@ void ScreenManager::loop() {
     MeshTextMessage msg;
     while (gMesh.popTextMessage(msg)) {
         bool isBroadcast = (msg.to == kBroadcastAddr || msg.to == 0);
-        uint32_t peer = isBroadcast ? kBroadcastAddr : (msg.fromMe ? msg.to : msg.from);
+        uint32_t sender = msg.from;
+        if (!msg.fromMe && !isBroadcast && sender == 0) {
+            Conversation* active = getConversation(gActiveConversation);
+            if (active && !active->isBroadcast) {
+                sender = active->peer;
+            }
+        }
+        uint32_t peer = isBroadcast ? kBroadcastAddr : (msg.fromMe ? msg.to : sender);
         int convIndex = ensureConversation(peer, isBroadcast, msg.channel);
         bool isActive = (convIndex == gActiveConversation);
         bool markUnread = (!msg.fromMe && !isActive);
-        Serial.printf("[App] RX route: peer=0x%08lX broadcast=%d ch=%u conv=%d active=%d unread=%d\n",
+        Serial.printf("[App] RX route: from=0x%08lX peer=0x%08lX broadcast=%d ch=%u conv=%d active=%d unread=%d\n",
+                      (unsigned long)sender,
                       (unsigned long)peer,
                       isBroadcast ? 1 : 0,
                       (unsigned)msg.channel,
                       convIndex,
                       isActive ? 1 : 0,
                       markUnread ? 1 : 0);
-        appendConversationMessage(convIndex, msg.fromMe, msg.text, msg.from, markUnread);
+        appendConversationMessage(convIndex, msg.fromMe, msg.text, sender, markUnread);
         gotMessage = true;
     }
     if (gotMessage) {

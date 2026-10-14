@@ -1206,7 +1206,7 @@ void MeshtasticClient::expirePendingDeliveries(uint32_t now) {
 }
 
 String MeshtasticClient::nodeLabel(uint32_t nodeNum) const {
-    if (nodeNum == 0) return String("Node");
+    if (nodeNum == 0) return String("Unknown");
     for (const auto& node : _nodes) {
         if (node.num == nodeNum) {
             if (node.shortName.length() > 0) return node.shortName;
