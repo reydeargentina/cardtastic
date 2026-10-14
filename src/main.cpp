@@ -585,9 +585,27 @@ bool isNodeActive(const MeshNodeInfo& node) {
     return (millis() - node.lastUpdateMs) <= kNodeActiveMs;
 }
 
-const char* nodeActiveTag(const MeshNodeInfo& node) {
-    if (node.lastUpdateMs == 0) return " [?]";
-    return isNodeActive(node) ? " [A]" : "";
+const char* nodeActivityLabel(const MeshNodeInfo& node) {
+    if (node.lastUpdateMs == 0) return "[UNKNOWN]";
+    return isNodeActive(node) ? "[ACTIVE]" : "[STALE]";
+}
+
+String nodeNameForRow(const String& name, const String& suffix, M5GFX& display, int maxWidth) {
+    String full = name + suffix;
+    if (display.textWidth(full) <= maxWidth) return full;
+
+    const String ellipsis = "...";
+    size_t end = 0;
+    String prefix;
+    while (end < name.length()) {
+        size_t next = nextUtf8Boundary(name, end);
+        String candidate = name.substring(0, next);
+        if (display.textWidth(candidate + ellipsis + suffix) > maxWidth) break;
+        end = next;
+        prefix = candidate;
+    }
+    if (prefix.length() > 0) return prefix + ellipsis + suffix;
+    return suffix;
 }
 
 String batteryStatusLabel() {
@@ -1309,25 +1327,27 @@ public:
 
         if (hasSel) {
             d.setCursor(4, 14);
-            d.print("Sel: ");
-            d.print(nodeDisplayName(selNode));
-            d.print(" ");
-            d.println(nodeHex(selNode.num));
+            String identity = nodeNameForRow(nodeDisplayName(selNode),
+                                             String(" ") + nodeHex(selNode.num),
+                                             d,
+                                             d.width() - 8);
+            d.println(identity);
 
             d.setCursor(4, 24);
+            d.print(nodeActivityLabel(selNode));
+            d.print(" Age:");
+            d.println(formatAge(selNode.lastUpdateMs));
+
+            d.setCursor(4, 34);
             d.print("SNR:");
             d.print(selNode.snr, 1);
-            d.print(" H:");
+            d.print(" Hops:");
             if (selNode.hasHops) {
                 d.print(selNode.hopsAway);
             } else {
                 d.print("-");
             }
-            d.print(" Ch:");
-            d.print(selNode.channel);
-
-            d.setCursor(4, 34);
-            d.print("Batt:");
+            d.print(" Batt:");
             if (selNode.hasBattery) {
                 if (selNode.batteryLevel > 100) {
                     d.print("PWR");
@@ -1338,14 +1358,7 @@ public:
             } else {
                 d.print("-");
             }
-            d.print(" V:");
-            if (selNode.hasVoltage) {
-                d.print(selNode.voltage, 2);
-            } else {
-                d.print("-");
-            }
-            d.print(" Age:");
-            d.println(formatAge(selNode.lastUpdateMs));
+            d.println();
         } else {
             d.setCursor(4, 14);
             d.println("No nodes yet");
@@ -1370,16 +1383,15 @@ public:
                 d.setTextColor(WHITE, BLACK);
             }
 
-            String label = nodeDisplayName(info);
-            if (label.length() > 14) {
-                label = label.substring(0, 13) + ".";
-            }
+            String suffix;
             if (info.num == gMesh.myNodeNum()) {
-                label += " [me]";
+                suffix += " [me]";
             } else if (info.via_mqtt) {
-                label += " [m]";
+                suffix += " [m]";
             }
-            label += nodeActiveTag(info);
+            suffix += " ";
+            suffix += nodeActivityLabel(info);
+            String label = nodeNameForRow(nodeDisplayName(info), suffix, d, d.width() - 12);
             d.setCursor(6, y);
             d.println(label);
         }
@@ -1410,10 +1422,34 @@ private:
     }
 
     void rebuildList() {
+        uint32_t selectedNodeNum = 0;
+        int selected = menu.current();
+        if (selected >= 0 && selected < (int)nodeIndexMap.size()) {
+            selectedNodeNum = gMesh.getNodeInfo(nodeIndexMap[selected]).num;
+        }
+
         nodeIndexMap.clear();
         int count = gMesh.getNodeCount();
         for (int i = 0; i < count; ++i) {
             nodeIndexMap.push_back(i);
+        }
+
+        std::sort(nodeIndexMap.begin(), nodeIndexMap.end(), [](int a, int b) {
+            MeshNodeInfo nodeA = gMesh.getNodeInfo(a);
+            MeshNodeInfo nodeB = gMesh.getNodeInfo(b);
+            if (nodeA.lastUpdateMs != nodeB.lastUpdateMs) {
+                return nodeA.lastUpdateMs > nodeB.lastUpdateMs;
+            }
+            return nodeA.num < nodeB.num;
+        });
+
+        if (selectedNodeNum != 0) {
+            for (int i = 0; i < (int)nodeIndexMap.size(); ++i) {
+                if (gMesh.getNodeInfo(nodeIndexMap[i]).num == selectedNodeNum) {
+                    menu.selected = i;
+                    return;
+                }
+            }
         }
         if (menu.current() >= (int)nodeIndexMap.size()) {
             menu.reset();
