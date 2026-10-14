@@ -399,6 +399,8 @@ static int gActiveConversation = -1;
 static int gSelectedNodeIndex = -1;
 static uint32_t gNextActivitySeq = 1;
 static uint32_t gNextDeliveryToken = 1;
+static ConnectionStatus gLastRenderedConnectionStatus = ConnectionStatus::DISCONNECTED;
+static bool gLastRenderedConfigComplete = false;
 
 constexpr uint32_t kNodeActiveMs = 5UL * 60UL * 1000UL;
 static bool gSdReady = false;
@@ -1005,6 +1007,11 @@ const char* connectionStatusLabel() {
     return "UNKNOWN";
 }
 
+const char* connectionOrSyncStatusLabel() {
+    if (gMesh.isConnected() && !gMesh.configComplete()) return "SYNC";
+    return connectionStatusLabel();
+}
+
 uint16_t connectionStatusColor() {
     switch (gMesh.status()) {
     case ConnectionStatus::CONNECTED:
@@ -1315,7 +1322,7 @@ public:
         d.fillCircle(bleDotX, bleDotY, bleDotR, connectionStatusColor());
         d.setCursor(bleDotX + bleDotR + 2, bleY);
         d.print("BLE: ");
-        d.println(connectionStatusLabel());
+        d.println(connectionOrSyncStatusLabel());
 
         String batt = batteryStatusLabel();
         int battX = d.width() - d.textWidth(batt) - 4;
@@ -1405,7 +1412,7 @@ public:
             d.println("CONNECTING");
             break;
         case ConnectionStatus::CONNECTED:
-            d.println("CONNECTED");
+            d.println(gMesh.configComplete() ? "CONNECTED" : "SYNC");
             break;
         case ConnectionStatus::ERROR:
             d.println("ERROR");
@@ -2832,6 +2839,15 @@ void ScreenManager::loop() {
         switchTo(ScreenId::PIN_ENTRY);
         return;
     }
+
+    bool connectionStateChanged = gLastRenderedConnectionStatus != gMesh.status() ||
+                                  gLastRenderedConfigComplete != gMesh.configComplete();
+    if (connectionStateChanged &&
+        (currentId == ScreenId::HOME || currentId == ScreenId::CONNECT)) {
+        needRedraw = true;
+    }
+    gLastRenderedConnectionStatus = gMesh.status();
+    gLastRenderedConfigComplete = gMesh.configComplete();
 
     if (tryLoadConversationsOnce()) {
         needRedraw = true;

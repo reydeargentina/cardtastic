@@ -91,6 +91,7 @@ public:
     bool             awaitingPasskey() const { return _awaitingPasskey; }
     bool             isScanning()  const { return _scanning; }
     bool             isConnected() const { return _status == ConnectionStatus::CONNECTED; }
+    bool             configComplete() const { return _configComplete; }
 
     // ---- Scan and devices ----
     void          startScan();
