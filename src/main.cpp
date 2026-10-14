@@ -487,11 +487,11 @@ bool loadNodeIdentityCache(uint32_t radioNode) {
             DynamicJsonDocument doc(cap);
             DeserializationError err = deserializeJson(doc, f);
             f.close();
-            if (!err && (doc["radio"] | 0UL) == radioNode) {
+            if (!err && (doc["radio"] | uint32_t{0}) == radioNode) {
                 JsonArray nodes = doc["nodes"].as<JsonArray>();
                 for (JsonObject obj : nodes) {
                     CachedNodeIdentity identity;
-                    identity.nodeNum = obj["num"] | 0UL;
+                    identity.nodeNum = obj["num"] | uint32_t{0};
                     identity.shortName = obj["short"] | "";
                     identity.longName = obj["long"] | "";
                     if (identity.nodeNum != 0 &&
@@ -705,13 +705,13 @@ void loadConversationsFromStorage() {
             continue;
         }
 
-        uint32_t peer = doc["peer"] | 0;
+        uint32_t peer = doc["peer"] | uint32_t{0};
         bool isBroadcast = doc["broadcast"] | false;
         uint8_t channel = doc["channel"] | 0;
         bool unread = doc["unread"] | false;
-        uint32_t radio = doc["radio"] | 0;
+        uint32_t radio = doc["radio"] | uint32_t{0};
         bool hasLastActivity = doc.containsKey("lastActivity");
-        uint32_t lastActivity = doc["lastActivity"] | 0;
+        uint32_t lastActivity = doc["lastActivity"] | uint32_t{0};
         if (isBroadcast && peer == 0) peer = kBroadcastAddr;
         if (!isBroadcast && peer == 0) {
             peer = parsePeerFromFilename(name);
@@ -742,7 +742,7 @@ void loadConversationsFromStorage() {
         if (msgs.isNull()) continue;
         for (JsonObject obj : msgs) {
             Message m;
-            m.from = obj["from"] | 0;
+            m.from = obj["from"] | uint32_t{0};
             m.fromMe = obj["fromMe"] | false;
             const char* txt = obj["text"] | "";
             m.text = String(txt);
