@@ -123,6 +123,171 @@ String omitEmoji(const String& text) {
     return result;
 }
 
+uint32_t displayCodepoint(uint32_t codepoint, bool customUppercase) {
+    switch (codepoint) {
+    case 0x00E1: return 0xA0; // á
+    case 0x00E9: return 0x82; // é
+    case 0x00ED: return 0xA1; // í
+    case 0x00F3: return 0xA2; // ó
+    case 0x00FA: return 0xA3; // ú
+    case 0x00FC: return 0x81; // ü
+    case 0x00F1: return 0xA4; // ñ
+    case 0x00C1: return customUppercase ? 0xE000 : 0xA0; // Á
+    case 0x00C9: return customUppercase ? 0xE001 : 0x82; // É
+    case 0x00CD: return customUppercase ? 0xE002 : 0xA1; // Í
+    case 0x00D3: return customUppercase ? 0xE003 : 0xA2; // Ó
+    case 0x00DA: return customUppercase ? 0xE004 : 0xA3; // Ú
+    case 0x00DC: return 0x9A; // Ü
+    case 0x00D1: return 0xA5; // Ñ
+    case 0x00BF: return 0xA8; // ¿
+    case 0x00A1: return 0xAD; // ¡
+    default: return 0;
+    }
+}
+
+void appendUtf8Codepoint(String& output, uint32_t codepoint) {
+    char encoded[5] = {0};
+    size_t length = 0;
+    if (codepoint < 0x80) {
+        encoded[length++] = static_cast<char>(codepoint);
+    } else if (codepoint < 0x800) {
+        encoded[length++] = static_cast<char>(0xC0 | (codepoint >> 6));
+        encoded[length++] = static_cast<char>(0x80 | (codepoint & 0x3F));
+    } else if (codepoint < 0x10000) {
+        encoded[length++] = static_cast<char>(0xE0 | (codepoint >> 12));
+        encoded[length++] = static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+        encoded[length++] = static_cast<char>(0x80 | (codepoint & 0x3F));
+    } else {
+        encoded[length++] = static_cast<char>(0xF0 | (codepoint >> 18));
+        encoded[length++] = static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+        encoded[length++] = static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+        encoded[length++] = static_cast<char>(0x80 | (codepoint & 0x3F));
+    }
+    encoded[length] = '\0';
+    output.concat(encoded);
+}
+
+String mapSpanishGlyphsForDisplay(const String& text, bool customUppercase = false) {
+    String result;
+    result.reserve(text.length());
+    for (size_t i = 0; i < text.length();) {
+        size_t byteCount = 0;
+        uint32_t codepoint = decodeUtf8Codepoint(text, i, byteCount);
+        uint32_t displayCode = displayCodepoint(codepoint, customUppercase);
+        if (displayCode != 0) {
+            appendUtf8Codepoint(result, displayCode);
+        } else {
+            result.concat(text.substring(i, i + byteCount));
+        }
+        i += byteCount;
+    }
+    return result;
+}
+
+bool isHexDigit(char c) {
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+int hexDigitValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return c - 'A' + 10;
+}
+
+String knownNodeName(uint32_t nodeNum) {
+    for (int i = 0; i < gMesh.getNodeCount(); ++i) {
+        MeshNodeInfo node = gMesh.getNodeInfo(i);
+        if (node.num != nodeNum) continue;
+        if (node.shortName.length() > 0) return node.shortName;
+        return node.longName;
+    }
+    return String();
+}
+
+String resolveNodeMentionsForDisplay(const String& text) {
+    String result;
+    result.reserve(text.length());
+    for (size_t i = 0; i < text.length();) {
+        if (text[i] == '@' && i + 10 <= text.length() && text[i + 1] == '!') {
+            uint32_t nodeNum = 0;
+            bool valid = true;
+            for (size_t j = i + 2; j < i + 10; ++j) {
+                if (!isHexDigit(text[j])) {
+                    valid = false;
+                    break;
+                }
+                nodeNum = (nodeNum << 4) | static_cast<uint32_t>(hexDigitValue(text[j]));
+            }
+            if (valid && (i + 10 == text.length() || !isHexDigit(text[i + 10]))) {
+                String name = knownNodeName(nodeNum);
+                if (name.length() > 0) {
+                    result += "@";
+                    result += name;
+                    i += 10;
+                    continue;
+                }
+            }
+        }
+
+        size_t byteCount = 0;
+        decodeUtf8Codepoint(text, i, byteCount);
+        result.concat(text.substring(i, i + byteCount));
+        i += byteCount;
+    }
+    return result;
+}
+
+String prepareMessageForDisplay(const String& text) {
+    return mapSpanishGlyphsForDisplay(resolveNodeMentionsForDisplay(omitEmoji(text)), true);
+}
+
+bool drawCustomSpanishGlyph(M5GFX& display, uint32_t codepoint, uint16_t color) {
+    static const uint8_t glyphs[][8] = {
+        {0x02, 0x04, 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11}, // Á
+        {0x02, 0x04, 0x1F, 0x10, 0x1E, 0x10, 0x10, 0x1F}, // É
+        {0x02, 0x04, 0x1F, 0x04, 0x04, 0x04, 0x04, 0x1F}, // Í
+        {0x02, 0x04, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x0E}, // Ó
+        {0x02, 0x04, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}  // Ú
+    };
+    if (codepoint < 0xE000 || codepoint > 0xE004) return false;
+
+    const uint8_t* glyph = glyphs[codepoint - 0xE000];
+    int x = display.getCursorX();
+    int y = display.getCursorY();
+    for (int row = 0; row < 8; ++row) {
+        for (int col = 0; col < 5; ++col) {
+            if (glyph[row] & (1U << (4 - col))) {
+                display.drawPixel(x + col, y + row, color);
+            }
+        }
+    }
+    display.setCursor(x + 6, y);
+    return true;
+}
+
+void drawDisplayText(M5GFX& display, const String& text, uint16_t color) {
+    size_t segmentStart = 0;
+    for (size_t i = 0; i < text.length();) {
+        size_t byteCount = 0;
+        uint32_t codepoint = decodeUtf8Codepoint(text, i, byteCount);
+        if (codepoint >= 0xE000 && codepoint <= 0xE004) {
+            if (i > segmentStart) {
+                display.print(text.substring(segmentStart, i));
+            }
+            drawCustomSpanishGlyph(display, codepoint, color);
+            i += byteCount;
+            segmentStart = i;
+        } else {
+            i += byteCount;
+        }
+    }
+    if (segmentStart < text.length()) {
+        display.print(text.substring(segmentStart));
+    }
+}
+
 size_t nextUtf8Boundary(const String& text, size_t index) {
     size_t byteCount = 0;
     decodeUtf8Codepoint(text, index, byteCount);
@@ -505,21 +670,22 @@ Conversation* getConversation(int index) {
 }
 
 String conversationTitle(const Conversation& conv) {
-    if (conv.isBroadcast) return gMesh.channelLabel(conv.channel);
-    return gMesh.nodeLabel(conv.peer);
+    if (conv.isBroadcast) return mapSpanishGlyphsForDisplay(gMesh.channelLabel(conv.channel), true);
+    return mapSpanishGlyphsForDisplay(gMesh.nodeLabel(conv.peer), true);
 }
 
 String conversationListTitle(const Conversation& conv) {
     if (conv.isBroadcast) {
-        return String("[ch") + String(conv.channel) + "] " + gMesh.channelLabel(conv.channel);
+        return mapSpanishGlyphsForDisplay(String("[ch") + String(conv.channel) + "] " +
+                                          gMesh.channelLabel(conv.channel));
     }
-    return gMesh.nodeLabel(conv.peer);
+    return mapSpanishGlyphsForDisplay(gMesh.nodeLabel(conv.peer));
 }
 
 String lastMessagePreview(const Conversation& conv) {
     if (conv.messages.empty()) return String("");
     const Message& msg = conv.messages.back();
-    String text = omitEmoji(msg.text);
+    String text = prepareMessageForDisplay(msg.text);
     text.replace('\n', ' ');
     if (msg.fromMe) {
         return String("Me: ") + text;
@@ -529,9 +695,20 @@ String lastMessagePreview(const Conversation& conv) {
 
 String truncateLabel(const String& text, size_t maxChars) {
     if (maxChars == 0) return String("");
-    if (text.length() <= maxChars) return text;
-    if (maxChars <= 3) return text.substring(0, maxChars);
-    return text.substring(0, maxChars - 3) + "...";
+    size_t end = 0;
+    size_t chars = 0;
+    while (end < text.length() && chars < maxChars) {
+        end = nextUtf8Boundary(text, end);
+        ++chars;
+    }
+    if (end == text.length()) return text;
+    if (maxChars <= 3) return text.substring(0, end);
+
+    size_t prefixEnd = 0;
+    for (size_t i = 0; i < maxChars - 3 && prefixEnd < text.length(); ++i) {
+        prefixEnd = nextUtf8Boundary(text, prefixEnd);
+    }
+    return text.substring(0, prefixEnd) + "...";
 }
 
 String nodeHex(uint32_t num) {
@@ -541,13 +718,13 @@ String nodeHex(uint32_t num) {
 }
 
 String nodeDisplayName(const MeshNodeInfo& node) {
-    if (node.shortName.length() > 0) return node.shortName;
-    if (node.longName.length() > 0) return node.longName;
+    if (node.shortName.length() > 0) return mapSpanishGlyphsForDisplay(node.shortName);
+    if (node.longName.length() > 0) return mapSpanishGlyphsForDisplay(node.longName);
     return nodeHex(node.num);
 }
 
 String channelDisplayName(const MeshChannelInfo& ch) {
-    if (ch.name.length() > 0) return ch.name;
+    if (ch.name.length() > 0) return mapSpanishGlyphsForDisplay(ch.name);
     if (ch.index == 0) return "LongFast";
     return String("Ch ") + ch.index;
 }
@@ -855,14 +1032,18 @@ struct ListMenuState {
             int y = startY + (i - top) * lineH;
             const auto& opt = items[i];
 
+            uint16_t textColor;
             if (i == selected) {
                 d.fillRect(0, y - 2, d.width(), lineH, DARKGREY);
-                d.setTextColor(opt.enabled ? BLACK : DARKGREY, DARKGREY);
+                textColor = opt.enabled ? BLACK : DARKGREY;
+                d.setTextColor(textColor, DARKGREY);
             } else {
-                d.setTextColor(opt.enabled ? WHITE : DARKGREY, BLACK);
+                textColor = opt.enabled ? WHITE : DARKGREY;
+                d.setTextColor(textColor, BLACK);
             }
             d.setCursor(8, y);
-            d.println(opt.label);
+            drawDisplayText(d, opt.label, textColor);
+            d.println();
         }
     }
 };
@@ -1711,7 +1892,7 @@ public:
         } else {
             String name = nodeDisplayName(node);
             if (name.length() > 18) {
-                name = name.substring(0, 17) + ".";
+                name = truncateLabel(name, 18);
             }
 
             d.setCursor(4, 14);
@@ -2089,7 +2270,9 @@ public:
             d.setCursor(4, 14);
             d.println("No conversation selected");
         } else {
-            d.println(conversationTitle(*conv));
+            String title = conversationTitle(*conv);
+            drawDisplayText(d, title, kColorHeaderText);
+            d.println();
             d.setCursor(4, 14);
             d.println("FN + ;/. SCROLL  | DEL BACK");
         }
@@ -2121,12 +2304,14 @@ public:
             const ChatLine& line = lines[i];
             if (line.coloredPrefixLength > 0 && line.coloredPrefixLength <= line.text.length()) {
                 d.setTextColor(line.prefixColor, kColorBodyBg);
-                d.print(line.text.substring(0, line.coloredPrefixLength));
+                drawDisplayText(d, line.text.substring(0, line.coloredPrefixLength), line.prefixColor);
                 d.setTextColor(kColorBodyText, kColorBodyBg);
-                d.println(line.text.substring(line.coloredPrefixLength));
+                drawDisplayText(d, line.text.substring(line.coloredPrefixLength), kColorBodyText);
+                d.println();
             } else {
                 d.setTextColor(kColorBodyText, kColorBodyBg);
-                d.println(line.text);
+                drawDisplayText(d, line.text, kColorBodyText);
+                d.println();
             }
             y += lineH;
         }
@@ -2295,6 +2480,7 @@ private:
         int maxWidth = d.width() - 4;
         for (const auto& msg : conv.messages) {
             String label = msg.fromMe ? String("Me") : gMesh.nodeLabel(msg.from);
+            label = mapSpanishGlyphsForDisplay(label, true);
             String prefix = label + "> ";
             size_t coloredPrefixLength = msg.fromMe ? 3 : 0;
             uint16_t prefixColor = kColorBodyText;
@@ -2318,7 +2504,7 @@ private:
                     break;
                 }
             }
-            String displayText = omitEmoji(msg.text);
+            String displayText = prepareMessageForDisplay(msg.text);
             appendWrappedText(prefix,
                               displayText,
                               maxWidth,
@@ -2705,6 +2891,7 @@ void setup() {
 
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
+    M5Cardputer.Display.setAttribute(lgfx::CP437_SWITCH, true);
 
     M5Cardputer.Display.setRotation(1);
     drawSplashScreen();
