@@ -525,8 +525,8 @@ MeshChannelInfo* MeshtasticClient::getOrCreateChannel(int8_t index) {
     entry.index = index;
     for (auto it = _channels.begin(); it != _channels.end(); ++it) {
         if (it->index > index) {
-            _channels.insert(it, entry);
-            return &(*it);
+            auto inserted = _channels.insert(it, entry);
+            return &(*inserted);
         }
     }
     _channels.push_back(entry);
