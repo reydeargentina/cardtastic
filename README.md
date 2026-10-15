@@ -1,66 +1,72 @@
 # Cardtastic
 
-Cardtastic is a simple, fast UI for Meshtastic nodes running on the M5Stack Cardputer v1.1. It connects to a Meshtastic radio over BLE and focuses on chat, nodes, and channels without changing device configuration.
+**Cardtastic v0.6** is a lightweight Meshtastic client for the **M5Stack Cardputer v1.1**. It connects to a Meshtastic radio over Bluetooth Low Energy (BLE) and puts conversations, channels, and nearby nodes at your fingertips—without changing the radio's configuration.
 
-Current version: v0.5 (see `CHANGELOG.md`)
+## What you can do
 
-## Features
-- BLE scan and connect to Meshtastic radios
-- Conversations list with unread markers and last-message previews
-- Channel list and quick open for broadcast chats
-- Node list with status and quick DM actions
-- Chat view with send/receive
-- Optional SD persistence for conversations
+- Scan for Meshtastic radios and connect over BLE, including PIN-protected pairing.
+- Browse known nodes and channels, and start direct or channel conversations.
+- Send and receive messages, see delivery progress, and spot unread conversations.
+- Keep recent conversations on a microSD card, when one is available.
+- See connection and initial synchronization status while the node's data loads.
 
-## Hardware
+Chat supports Spanish accents and UTF-8 text wrapping. Emoji are omitted from displayed messages.
+
+## Requirements
+
 - M5Stack Cardputer v1.1 (ESP32-S3)
-- Meshtastic node with BLE enabled
-- Optional microSD card (for persistence)
+- A Meshtastic radio with Bluetooth enabled
+- PlatformIO (Core/CLI or the PlatformIO IDE extension)
+- Optional: microSD card for conversation persistence
 
-## Software
-- PlatformIO
-- Arduino framework
+## Build and upload
 
-## Build and Upload (PlatformIO)
-```bash
+From the project directory, build the firmware:
+
+```sh
+pio run -e m5stack-cardputer
+```
+
+Connect the Cardputer over USB and upload:
+
+```sh
 pio run -e m5stack-cardputer -t upload
 ```
 
-Serial monitor:
-```bash
+To open the serial monitor:
+
+```sh
 pio device monitor -e m5stack-cardputer
 ```
 
-## Local PlatformIO Overrides
-For local port settings, create `platformio.local.ini` (ignored by git) and override the ports there:
+The project targets the `m5stack-cardputer` PlatformIO environment. For a local serial-port override, create the git-ignored `platformio.local.ini` file:
+
 ```ini
 [env:m5stack-cardputer]
-upload_port = /dev/serial/by-id/usb-...
-monitor_port = /dev/serial/by-id/usb-...
+upload_port = /dev/serial/by-id/your-cardputer
+monitor_port = /dev/serial/by-id/your-cardputer
 ```
 
-## Usage
-It's important to note that Cardtastic is intended to be used as a simple UI to interact with an already configured node. The use case is to read and send messages when you're on the go, without using a phone. It does not change core node configuration (region, channels, frequencies); set those in the Meshtastic phone app first.
+## First connection
 
-Quick start:
-- Scan for devices.
-- Connect to your node.
-- Open Conversations or Channels and start chatting.
-- Connect: use Scan to find radios, then connect.
-- Conversations: open recent chats; unread messages show a `*`.
-- Channels: open a broadcast chat by channel.
-- Nodes: view known nodes and open a DM.
+1. Make sure Bluetooth is enabled on your already-configured Meshtastic radio.
+2. On Cardtastic, choose **Connect** and scan for the radio.
+3. Select the radio to connect. If it requests a BLE passkey, enter the PIN shown by the radio; an existing bond may connect without prompting.
+4. Wait for the initial node and channel synchronization to finish, then open **Conversations**, **Channels**, or **Nodes**.
 
-Navigation (Cardputer keyboard):
-- Menu screens: Arrow keys or W/S to move, Enter or Right to select, Backspace or Left to go back.
-- Chat: type to compose, Enter to send.
-- Chat scroll: hold FN and use `;` (up) / `.` (down). Hold Shift for page scroll.
+Cardtastic is intended for messaging with an already-configured node. Configure region, channels, and frequencies with the Meshtastic app; Cardtastic does not modify those settings.
 
-## BLE Passkey (v0.5)
-Cardtastic prompts for the BLE PIN when the node requests it. If the node is already bonded, it connects without prompting. Use the PIN shown on the node when pairing.
+## Controls
 
-## Persistence (SD)
-If a microSD card is present, Cardtastic stores conversations as JSON under `/cardtastic/` on the card. The app keeps the most recent 50 messages per conversation. If no card is available, conversations live in RAM only.
+- **Menus:** Arrow keys or W/S to move; Enter or Right to select; Backspace or Left to go back.
+- **Chat:** Type to compose and press Enter to send. Backspace edits the draft.
+- **Chat scrolling:** Hold FN and press `;` to scroll up or `.` to scroll down. Hold Shift for page scrolling.
+- **Delete/back:** In the connection list, Backspace deletes the selected entry; FN+Backspace goes back.
 
-## License
-This project is licensed under the GPLv3.
+## Conversation storage
+
+When a microSD card is available, Cardtastic stores conversation data as JSON under `/cardtastic/` and keeps up to the most recent 50 messages per conversation. Without an SD card, conversations remain in RAM and are lost when the device restarts.
+
+## Changelog and license
+
+See [CHANGELOG.md](CHANGELOG.md) for release history. Cardtastic is licensed under the GNU General Public License v3.0; see [LICENSE](LICENSE).

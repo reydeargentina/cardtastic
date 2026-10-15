@@ -1310,7 +1310,7 @@ public:
         // --- Header (small text) ---
         d.setTextSize(1);
         d.setTextColor(kColorHeaderText, kColorHeaderBg);
-        String title = "Cardtastic 0.5";
+        String title = "Cardtastic 0.6";
         int titleX = (d.width() - d.textWidth(title)) / 2;
         if (titleX < 0) titleX = 0;
         d.setCursor(titleX, 4);
