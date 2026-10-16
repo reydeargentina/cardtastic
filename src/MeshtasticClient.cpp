@@ -15,6 +15,7 @@ constexpr int kScanSeconds = 8;
 constexpr uint8_t kMaxAutoConnectAttempts = 3;
 constexpr uint32_t kAutoConnectAttemptTimeoutMs = 15000;
 constexpr uint32_t kAutoConnectRetryDelaysMs[] = {1000, 2500};
+constexpr uint32_t kBleConnectTimeoutMs = 10000;
 constexpr size_t kScanObservationCapacity = 24;
 constexpr uint32_t kAuthenticationTimeoutMs = 60000;
 constexpr uint32_t kTransportCloseTimeoutMs = 10000;
@@ -1056,7 +1057,7 @@ bool MeshtasticClient::startConnection(int index) {
     }
     _client->setClientCallbacks(&gClientCallbacks, false);
     _client->setSelfDelete(false, false);
-    _client->setConnectTimeout(10);
+    _client->setConnectTimeout(kBleConnectTimeoutMs);
     if (!_ble.begin()) return false;
     portENTER_CRITICAL(&gBleEventMux);
     gCallbackSession = _ble.id;
