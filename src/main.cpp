@@ -482,6 +482,22 @@ String nodeIdentityCachePath(uint32_t radioNode) {
     return String(kStorageDir) + "/nodes_" + nodeHexId(radioNode) + ".json";
 }
 
+String radioStoragePath(uint32_t radioNode) {
+    return String(kStorageDir) + "/" + nodeHexId(radioNode);
+}
+
+bool ensureRadioStorage(uint32_t radioNode) {
+    if (radioNode == 0 || !ensureStorage()) return false;
+    String path = radioStoragePath(radioNode);
+    if (SD.exists(path)) {
+        File dir = SD.open(path);
+        bool valid = dir && dir.isDirectory();
+        if (dir) dir.close();
+        return valid;
+    }
+    return SD.mkdir(path);
+}
+
 bool loadNodeIdentityCache(uint32_t radioNode) {
     if (radioNode == 0) return false;
     if (gNodeIdentityCacheRadio != radioNode) {
@@ -645,15 +661,112 @@ uint32_t parsePeerFromFilename(const String& name) {
 }
 
 String conversationFilePath(const Conversation& conv) {
+    uint32_t radio = gConversationRadioNode;
+    String directory = radioStoragePath(radio);
     if (conv.isBroadcast) {
-        return String(kStorageDir) + "/ch_" + String(conv.channel) + ".json";
+        return directory + "/ch_" + String(conv.channel) + ".json";
     }
-    return String(kStorageDir) + "/dm_" + nodeHexId(conv.peer) + ".json";
+    return directory + "/dm_" + nodeHexId(conv.peer) + ".json";
+}
+
+String conversationFilePath(uint32_t radio, bool isBroadcast, uint8_t channel, uint32_t peer) {
+    String directory = radioStoragePath(radio);
+    if (isBroadcast) return directory + "/ch_" + String(channel) + ".json";
+    return directory + "/dm_" + nodeHexId(peer) + ".json";
+}
+
+void migrateLegacyConversations(uint32_t radioNode) {
+    if (radioNode == 0 || !ensureRadioStorage(radioNode)) return;
+
+    File dir = SD.open(kStorageDir);
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        return;
+    }
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        if (f.isDirectory()) {
+            f.close();
+            continue;
+        }
+        String sourcePath = String(f.name());
+        int slash = sourcePath.lastIndexOf('/');
+        String baseName = slash >= 0 ? sourcePath.substring(slash + 1) : sourcePath;
+        if (!baseName.endsWith(".json") || baseName.startsWith("nodes_")) {
+            f.close();
+            continue;
+        }
+
+        size_t capacity = f.size() * 2 + 512;
+        if (capacity < 2048) capacity = 2048;
+        if (capacity > kConversationJsonMax) capacity = kConversationJsonMax;
+        DynamicJsonDocument doc(capacity);
+        DeserializationError error = deserializeJson(doc, f);
+        f.close();
+        // Legacy records without an exact radio ID are ambiguous. Leave them
+        // untouched for an explicit/manual recovery instead of guessing.
+        if (error || (doc["radio"] | uint32_t{0}) != radioNode) continue;
+
+        uint32_t peer = doc["peer"] | uint32_t{0};
+        bool isBroadcast = doc["broadcast"] | false;
+        uint8_t channel = doc["channel"] | 0;
+        if (isBroadcast && peer == 0) peer = kBroadcastAddr;
+        if (!isBroadcast && peer == 0) peer = parsePeerFromFilename(baseName);
+        if (peer == 0) continue;
+
+        String destination = conversationFilePath(radioNode, isBroadcast, channel, peer);
+        if (SD.exists(destination)) continue; // The namespaced copy is authoritative.
+        String temporary = destination + ".migrate.tmp";
+        SD.remove(temporary);
+
+        File source = SD.open(sourcePath, FILE_READ);
+        File target = SD.open(temporary, FILE_WRITE);
+        if (!source || !target) {
+            if (source) source.close();
+            if (target) target.close();
+            SD.remove(temporary);
+            continue;
+        }
+        uint8_t buffer[256];
+        bool copied = true;
+        while (source.available()) {
+            int count = source.read(buffer, sizeof(buffer));
+            if (count <= 0 || target.write(buffer, static_cast<size_t>(count)) != static_cast<size_t>(count)) {
+                copied = false;
+                break;
+            }
+        }
+        source.close();
+        target.close();
+        if (!copied) {
+            SD.remove(temporary);
+            continue;
+        }
+
+        File verify = SD.open(temporary, FILE_READ);
+        bool verified = false;
+        if (verify) {
+            DynamicJsonDocument verifyDoc(capacity);
+            DeserializationError verifyError = deserializeJson(verifyDoc, verify);
+            verified = !verifyError && (verifyDoc["radio"] | uint32_t{0}) == radioNode &&
+                       (verifyDoc["peer"] | uint32_t{0}) == (doc["peer"] | uint32_t{0}) &&
+                       (verifyDoc["broadcast"] | false) == isBroadcast &&
+                       (verifyDoc["channel"] | 0) == channel;
+            verify.close();
+        }
+        if (verified && SD.rename(temporary, destination)) {
+            // Remove the legacy source only after the namespaced file is complete
+            // and can be parsed with the expected identity.
+            SD.remove(sourcePath);
+        } else {
+            SD.remove(temporary);
+        }
+    }
+    dir.close();
 }
 
 void persistConversation(int convIndex) {
     uint32_t radio = gMesh.myNodeNum();
-    if (radio == 0 || radio != gConversationRadioNode || !ensureStorage()) return;
+    if (radio == 0 || radio != gConversationRadioNode || !ensureRadioStorage(radio)) return;
     Conversation* conv = getConversation(convIndex);
     if (!conv) return;
 
@@ -694,9 +807,12 @@ void persistConversation(int convIndex) {
 void loadConversationsFromStorage() {
     if (!ensureStorage()) return;
     uint32_t currentRadio = gMesh.myNodeNum();
+    if (currentRadio == 0 || currentRadio != gConversationRadioNode || !ensureRadioStorage(currentRadio)) return;
+    migrateLegacyConversations(currentRadio);
     uint32_t maxActivity = 0;
 
-    File dir = SD.open(kStorageDir);
+    String radioDir = radioStoragePath(currentRadio);
+    File dir = SD.open(radioDir);
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
         return;

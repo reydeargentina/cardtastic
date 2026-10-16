@@ -59,5 +59,21 @@ validate its policy, not FreeRTOS scheduling or NimBLE's internals.
   delivery ends as failed in the original radio's runtime history, never updates
   a message on the other radio.
 
+## Conversation storage checks (issue #5)
+
+- With two radios and the same broadcast channel and DM peer, save messages on
+  both; verify they are stored under separate `/cardtastic/<radio-id>/`
+  directories and remain distinct after switching A -> B -> A.
+- Start with a legacy root-level conversation whose `radio` field matches A.
+  On A's first load it should be copied to A's namespace, parsed and identity-
+  checked before the legacy source is removed.
+- Force a failed/partial migration (for example, remove the card during copy).
+  The legacy source must remain available and the incomplete temporary file
+  must not be treated as a conversation.
+- A legacy root-level file with a missing/zero `radio` field is ambiguous: it
+  must remain untouched and must not be loaded automatically for either radio.
+- If the namespaced destination already exists, it is authoritative; migration
+  must not overwrite it with the legacy file.
+
 Record radio firmware version and serial logs. A native pass and a successful
 firmware build do not replace these hardware checks.
