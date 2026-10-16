@@ -21,6 +21,7 @@ enum class NavKey {
     DOWN_FAST,
     ENTER,
     ESC,
+    RETRY_SYNC,
     TOGGLE_AUTOCONNECT
 };
 
@@ -401,6 +402,8 @@ static uint32_t gNextActivitySeq = 1;
 static uint32_t gNextDeliveryToken = 1;
 static ConnectionStatus gLastRenderedConnectionStatus = ConnectionStatus::DISCONNECTED;
 static bool gLastRenderedConfigComplete = false;
+static String gLastRenderedSessionStatus;
+static String gLastRenderedError;
 
 constexpr uint32_t kNodeActiveMs = 5UL * 60UL * 1000UL;
 static bool gSdReady = false;
@@ -989,33 +992,18 @@ bool getSelectedNodeInfo(MeshNodeInfo& out) {
 }
 
 const char* connectionStatusLabel() {
-    switch (gMesh.status()) {
-    case ConnectionStatus::DISCONNECTED:
-        return "DISCONNECTED";
-    case ConnectionStatus::SCANNING:
-        return "SCANNING";
-    case ConnectionStatus::CONNECTING:
-        return "CONNECTING";
-    case ConnectionStatus::CONNECTED:
-        if (gMesh.lastError().length() > 0) {
-            return "CONNECTED!";
-        }
-        return "CONNECTED";
-    case ConnectionStatus::ERROR:
-        return "ERROR";
-    }
-    return "UNKNOWN";
+    return gMesh.sessionStatusLabel();
 }
 
 const char* connectionOrSyncStatusLabel() {
-    if (gMesh.isConnected() && !gMesh.configComplete()) return "SYNC";
     return connectionStatusLabel();
 }
 
 uint16_t connectionStatusColor() {
     switch (gMesh.status()) {
     case ConnectionStatus::CONNECTED:
-        if (gMesh.lastError().length() > 0) {
+        if (gMesh.syncFailed()) return RED;
+        if (!gMesh.readyToSend() || gMesh.lastError().length() > 0) {
             return YELLOW;
         }
         return GREEN;
@@ -1385,6 +1373,9 @@ public:
         case NavKey::TOGGLE_AUTOCONNECT:
             gMesh.toggleAutoConnect();
             break;
+        case NavKey::RETRY_SYNC:
+            gMesh.retryConfig();
+            break;
         default:
             break;
         }
@@ -1401,23 +1392,7 @@ public:
         d.setTextColor(kColorHeaderText, kColorHeaderBg);
         d.setCursor(4, 4);
         d.print("Status: ");
-        switch (gMesh.status()) {
-        case ConnectionStatus::DISCONNECTED:
-            d.println("DISCONNECTED");
-            break;
-        case ConnectionStatus::SCANNING:
-            d.println("SCANNING");
-            break;
-        case ConnectionStatus::CONNECTING:
-            d.println("CONNECTING");
-            break;
-        case ConnectionStatus::CONNECTED:
-            d.println(gMesh.configComplete() ? "CONNECTED" : "SYNC");
-            break;
-        case ConnectionStatus::ERROR:
-            d.println("ERROR");
-            break;
-        }
+        d.println(gMesh.sessionStatusLabel());
 
         d.setCursor(4, 14);
         if (gMesh.status() == ConnectionStatus::CONNECTED) {
@@ -1483,7 +1458,7 @@ public:
         int h = d.height();
         d.setCursor(4, h - kFooterH + 1);
         String footer = String("A:Auto ") + (gMesh.autoConnectEnabled() ? "ON" : "OFF");
-        footer += gMesh.isScanning() ? "  Scanning..." : "  Enter:select Del:back";
+        footer += gMesh.isScanning() ? "  Scanning..." : " R:Sync Enter:select";
         d.print(footer);
     }
 
@@ -1607,7 +1582,7 @@ private:
     }
 
     void attemptConnect() {
-        if (pinBuffer.length() == 0) {
+        if (pinBuffer.length() != 6) {
             return;
         }
         uint32_t pin = (uint32_t)pinBuffer.toInt();
@@ -2337,40 +2312,33 @@ public:
         case NavKey::ENTER:
             // Send message if there is input
             if (inputBuffer.length() > 0) {
+                // Keep the draft intact until authentication/configuration is ready.
+                if (!gMesh.readyToSend()) break;
                 uint32_t dest = conv->isBroadcast ? kBroadcastAddr : conv->peer;
-                if (!gMesh.isConnected()) {
+                uint32_t deliveryToken = gNextDeliveryToken++;
+                if (deliveryToken == 0) deliveryToken = gNextDeliveryToken++;
+                bool sent = gMesh.sendTextMessage(inputBuffer,
+                                                  dest,
+                                                  conv->channel,
+                                                  deliveryToken);
+                if (sent) {
                     appendConversationMessage(gActiveConversation,
                                               true,
-                                              String("[not connected] ") + inputBuffer,
+                                              inputBuffer,
+                                              gMesh.myNodeNum(),
+                                              false,
+                                              MessageDeliveryState::PENDING,
+                                              deliveryToken);
+                    if (!conv->isBroadcast && dest != 0) {
+                        gMesh.noteNode(dest);
+                    }
+                } else {
+                    appendConversationMessage(gActiveConversation,
+                                              true,
+                                              String("[send failed] ") + inputBuffer,
                                               gMesh.myNodeNum(),
                                               false,
                                               MessageDeliveryState::FAILED);
-                } else {
-                    uint32_t deliveryToken = gNextDeliveryToken++;
-                    if (deliveryToken == 0) deliveryToken = gNextDeliveryToken++;
-                    bool sent = gMesh.sendTextMessage(inputBuffer,
-                                                      dest,
-                                                      conv->channel,
-                                                      deliveryToken);
-                    if (sent) {
-                        appendConversationMessage(gActiveConversation,
-                                                  true,
-                                                  inputBuffer,
-                                                  gMesh.myNodeNum(),
-                                                  false,
-                                                  MessageDeliveryState::PENDING,
-                                                  deliveryToken);
-                        if (!conv->isBroadcast && dest != 0) {
-                            gMesh.noteNode(dest);
-                        }
-                    } else {
-                        appendConversationMessage(gActiveConversation,
-                                                  true,
-                                                  String("[send failed] ") + inputBuffer,
-                                                  gMesh.myNodeNum(),
-                                                  false,
-                                                  MessageDeliveryState::FAILED);
-                    }
                 }
 
                 inputBuffer = "";
@@ -2474,7 +2442,7 @@ public:
         d.drawFastHLine(0, h - inputH, w, kColorSeparator);
         d.setTextColor(kColorFooterText, kColorFooterBg);
         d.setCursor(2, h - inputH + 1);
-        d.print("> ");
+        d.print(gMesh.readyToSend() ? "> " : "[not ready] ");
         d.print(inputBuffer);
     }
 
@@ -2839,15 +2807,21 @@ void ScreenManager::loop() {
         switchTo(ScreenId::PIN_ENTRY);
         return;
     }
+    if (currentId == ScreenId::PIN_ENTRY && !gMesh.awaitingPasskey()) {
+        switchTo(ScreenId::CONNECT);
+    }
 
     bool connectionStateChanged = gLastRenderedConnectionStatus != gMesh.status() ||
-                                  gLastRenderedConfigComplete != gMesh.configComplete();
-    if (connectionStateChanged &&
-        (currentId == ScreenId::HOME || currentId == ScreenId::CONNECT)) {
+                                  gLastRenderedConfigComplete != gMesh.configComplete() ||
+                                  gLastRenderedSessionStatus != gMesh.sessionStatusLabel() ||
+                                  gLastRenderedError != gMesh.lastError();
+    if (connectionStateChanged) {
         needRedraw = true;
     }
     gLastRenderedConnectionStatus = gMesh.status();
     gLastRenderedConfigComplete = gMesh.configComplete();
+    gLastRenderedSessionStatus = gMesh.sessionStatusLabel();
+    gLastRenderedError = gMesh.lastError();
 
     if (tryLoadConversationsOnce()) {
         needRedraw = true;
@@ -2993,6 +2967,11 @@ void ScreenManager::loop() {
                 bool fast = st.shift;
                 for (auto c : st.word) {
                     switch (c) {
+
+                    case 'r':
+                    case 'R':
+                        if (currentId == ScreenId::CONNECT) nk = NavKey::RETRY_SYNC;
+                        break;
 
                     case 'a':
                     case 'A':

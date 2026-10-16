@@ -4,6 +4,7 @@
 #include <deque>
 #include <vector>
 #include <NimBLEDevice.h>
+#include "ClientState.h"
 
 // BLE connection state to the Meshtastic node
 enum class ConnectionStatus {
@@ -91,7 +92,11 @@ public:
     bool             awaitingPasskey() const { return _awaitingPasskey; }
     bool             isScanning()  const { return _scanning; }
     bool             isConnected() const { return _status == ConnectionStatus::CONNECTED; }
-    bool             configComplete() const { return _configComplete; }
+    bool             configComplete() const { return _sync.phase == MeshSyncPhase::READY; }
+    bool             syncFailed() const { return _sync.phase == MeshSyncPhase::FAILED; }
+    const char*      sessionStatusLabel() const;
+    bool             readyToSend() const;
+    bool             retryConfig();
 
     // ---- Scan and devices ----
     void          startScan();
@@ -118,10 +123,6 @@ public:
     int  connectedDeviceIndex() const { return _connectedIndex; }
     void debugDumpServices();
     void disconnect();
-    void handleDisconnect(int reason);
-    void handleConnect(NimBLEClient* pClient);
-    void handleConnectFail(NimBLEClient* pClient, int reason);
-    void handleAuthComplete(const NimBLEConnInfo& connInfo);
 
     // ---- Incoming messages (text) ----
     bool     popTextMessage(MeshTextMessage& out);
@@ -138,10 +139,18 @@ public:
     void setPasskey(uint32_t passkey);
     void clearPasskey();
     bool submitPasskey(uint32_t passkey);
-    void handlePasskeyRequest(const NimBLEConnInfo& connInfo);
 
 private:
     // --- Internal helpers ---
+    void processBleEvents();
+    void handleDisconnect(int reason);
+    void handleConnect();
+    void handleConnectFail(int reason);
+    void handleAuthComplete(bool encrypted);
+    void handlePasskeyRequest(uint16_t handle);
+    bool startConnection(int index);
+    void closeTransport();
+    void processTransportClose();
     void pullFromRadioUntilEmpty(bool logEmpty = true);
     bool decodeFromRadioAndQueue(const uint8_t* data, size_t len);
     bool writeToRadio(const uint8_t* data, size_t len, const char* context);
@@ -165,10 +174,6 @@ private:
     bool attemptAutoConnect();
     void scheduleAutoConnectRetry(const char* reason);
     void processAutoConnectRetries(uint32_t now);
-    void handleFromNumNotify(NimBLERemoteCharacteristic* chr,
-                             uint8_t* data, size_t len, bool isNotify);
-    void handleLogNotify(NimBLERemoteCharacteristic* chr,
-                         uint8_t* data, size_t len, bool isNotify);
 
     ConnectionStatus            _status;
     String                      _radioName;
@@ -193,11 +198,11 @@ private:
     uint32_t                    _nextAutoConnectAttemptMs;
     uint32_t                    _myNodeNum;
     bool                        _needsPull;
-    bool                        _configRequested;
-    bool                        _configComplete;
-    uint8_t                     _configAttempts;
-    uint32_t                    _configRequestMs;
-    uint32_t                    _nextConfigAttemptMs;
+    MeshConfigSync              _sync;
+    MeshBleSession              _ble;
+    int                         _nextConnectIndex = -1;
+    uint32_t                    _phaseStartedMs = 0;
+    uint32_t                    _closeStartedMs = 0;
     uint32_t                    _nextPacketId;
     uint32_t                    _lastPollMs;
     uint32_t                    _lastFromNum;
