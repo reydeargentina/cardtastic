@@ -1,8 +1,10 @@
 #include "ClientState.h"
+#include "MessageTextPolicy.h"
 #include "StoragePolicy.h"
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include <string>
 #include <vector>
 
@@ -38,6 +40,44 @@ static void storagePolicy() {
     mergeStorageHistories(disjoint, ram, 3,
         [](const std::string& a, const std::string& b) { return a == b; });
     assert((disjoint == std::vector<std::string>{"disk-2", "ram-1", "ram-2"}));
+}
+
+static void messageTextPolicy() {
+    assert(messageTextFits(199));
+    assert(messageTextFits(200));
+    assert(!messageTextFits(201));
+
+    const std::string twoByte = std::string(198, 'a') + "\xC3\xA9";
+    const std::string twoByteOver = std::string(199, 'a') + "\xC3\xA9";
+    const std::string threeByte = std::string(197, 'a') + "\xE2\x82\xAC";
+    const std::string fourByte = std::string(196, 'a') + "\xF0\x9F\x8C\x99";
+    assert(twoByte.size() == 200 && messageTextFits(twoByte.size()));
+    assert(twoByteOver.size() == 201 && !messageTextFits(twoByteOver.size()));
+    assert(threeByte.size() == 200 && messageTextFits(threeByte.size()));
+    assert(fourByte.size() == 200 && messageTextFits(fourByte.size()));
+    assert(isValidUtf8(twoByte.data(), twoByte.size()));
+    assert(isValidUtf8(threeByte.data(), threeByte.size()));
+    assert(isValidUtf8(fourByte.data(), fourByte.size()));
+    assert(!isValidUtf8("\xC0\xAF", 2)); // overlong sequence
+    assert(!isValidUtf8("\xE2\x82", 2)); // truncated codepoint
+
+    const std::string mixed = std::string("A") + "\xC3\xA9" + "\xE2\x82\xAC" + "\xF0\x9F\x8C\x99";
+    size_t cursor = mixed.size();
+    cursor = previousUtf8Boundary(mixed.data(), mixed.size(), cursor);
+    assert(cursor == mixed.size() - 4); // remove one four-byte codepoint
+    cursor = previousUtf8Boundary(mixed.data(), mixed.size(), cursor);
+    assert(cursor == mixed.size() - 7); // then one three-byte codepoint
+    cursor = previousUtf8Boundary(mixed.data(), mixed.size(), cursor);
+    assert(cursor == 1); // then the two-byte é
+    cursor = previousUtf8Boundary(mixed.data(), mixed.size(), cursor);
+    assert(cursor == 0); // finally the ASCII A
+
+    uint8_t payload[200] = {};
+    assert(copyMessageTextPayload(twoByte.c_str(), twoByte.size(), payload, sizeof(payload)));
+    assert(memcmp(payload, twoByte.data(), twoByte.size()) == 0);
+    memset(payload, 0xA5, sizeof(payload));
+    assert(!copyMessageTextPayload(twoByteOver.c_str(), twoByteOver.size(), payload, sizeof(payload)));
+    for (size_t i = 0; i < sizeof(payload); ++i) assert(payload[i] == 0xA5);
 }
 
 static void finiteAttempts(bool writeFails, uint32_t now) {
@@ -232,6 +272,7 @@ static void radioIdentityIsolation() {
 
 int main() {
     storagePolicy();
+    messageTextPolicy();
     synchronization();
     eventQueue();
     lifecycle();

@@ -201,18 +201,25 @@ diseño y validación amplia. No son estimaciones de días.
 ### CT-07 — Evitar truncamiento silencioso al enviar texto
 
 - **Tipo:** bug confirmado. **Prioridad:** P1. **Tamaño:** M.
-- **Evidencia:** `MeshtasticClient.cpp:1316–1319` recorta al tamaño del payload
-  (233 bytes en el protobuf incluido). `ChatScreen` permite escribir sin
-  límite y guarda el texto completo como enviado. Por tanto, el historial
-  puede mostrar algo distinto de lo que salió por radio. El recorte tampoco
-  respeta necesariamente un límite UTF-8 si en el futuro entra texto no ASCII.
-- **Alcance:** límite de bytes compartido entre cliente y editor, rechazo
-  explícito de exceso, contador, vista horizontal del cursor y conservación
-  del borrador si falla el envío. Verificar límite efectivo con el firmware
-  soportado, sin confundir bytes con caracteres.
+- **Evidencia:** `sendTextMessage()` recorta al tamaño del payload protobuf
+  (233 bytes), mientras `ChatScreen` permite escribir sin límite y guarda el
+  texto completo como enviado. El historial puede diferir de lo transmitido;
+  el recorte también puede dividir una secuencia UTF-8.
+- **Alcance acordado:** máximo de producto de 200 bytes UTF-8 compartido entre
+  editor y cliente. Es deliberadamente conservador respecto de los 233 bytes
+  del campo protobuf: el firmware añade sobrecarga de serialización y puede
+  agregar cifrado PKI. Rechazo explícito sin truncamiento, contador en bytes,
+  ventana horizontal que conserve visible el cursor al final y borrador
+  editable ante cualquier fallo inmediato. El límite no depende de si una
+  versión futura del firmware amplía su payload.
+- **Compatibilidad comprobada por fuente:** el teclado clásico de Meshtastic
+  v2.6.11 permite hasta `DATA_PAYLOAD_LEN` en su editor, mientras las apps
+  oficiales Android y Apple usan 200 bytes. Cardtastic conserva el límite de
+  200 como política común para v2.6.11 y firmware posteriores.
 - **Aceptación:** probar límite − 1, límite y límite + 1; el cliente nunca
-  recorta silenciosamente; el mensaje registrado coincide con el enviado;
-  el final del borrador sigue visible; el texto fallido se puede corregir.
+  recorta silenciosamente; el mensaje registrado coincide con el payload; el
+  final del borrador sigue visible; fallos de validación/escritura no crean
+  un mensaje enviado ni borran el borrador.
 - **Rama:** `fix/message-byte-limit`.
 - **Dependencias:** ninguna.
 

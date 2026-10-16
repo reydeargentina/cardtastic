@@ -9,6 +9,7 @@
 #include <NimBLEDevice.h> 
 #include <string>
 #include "MeshtasticClient.h"
+#include "MessageTextPolicy.h"
 #include "StoragePolicy.h"
 #include "meshtastic/channel.pb.h"
 
@@ -2661,7 +2662,7 @@ class ChatScreen : public Screen {
     };
 
 public:
-    ChatScreen() : inputBuffer("") {}
+    ChatScreen() : inputBuffer(""), sendFeedback("") {}
 
     void onEnter() override {
         Conversation* conv = getConversation(gActiveConversation);
@@ -2675,6 +2676,7 @@ public:
     void onExit() override {
         gActiveConversation = -1;
         inputBuffer = "";
+        sendFeedback = "";
     }
 
     void handleNav(NavKey k) override {
@@ -2725,17 +2727,23 @@ public:
             if (inputBuffer.length() > 0) {
                 // Keep the draft intact until authentication/configuration is ready.
                 if (!gMesh.readyToSend()) break;
+                if (!messageTextFits(inputBuffer.length()) ||
+                    !isValidUtf8(inputBuffer.c_str(), inputBuffer.length())) {
+                    sendFeedback = !messageTextFits(inputBuffer.length()) ? "Message too long" : "Invalid UTF-8";
+                    break;
+                }
                 uint32_t dest = conv->isBroadcast ? kBroadcastAddr : conv->peer;
                 uint32_t deliveryToken = gNextDeliveryToken++;
                 if (deliveryToken == 0) deliveryToken = gNextDeliveryToken++;
-                bool sent = gMesh.sendTextMessage(inputBuffer,
+                String outgoingText = inputBuffer;
+                bool sent = gMesh.sendTextMessage(outgoingText,
                                                   dest,
                                                   conv->channel,
                                                   deliveryToken);
                 if (sent) {
                     appendConversationMessage(gActiveConversation,
                                               true,
-                                              inputBuffer,
+                                              outgoingText,
                                               gMesh.myNodeNum(),
                                               false,
                                               MessageDeliveryState::PENDING,
@@ -2743,18 +2751,12 @@ public:
                     if (!conv->isBroadcast && dest != 0) {
                         gMesh.noteNode(dest);
                     }
+                    inputBuffer = "";
+                    sendFeedback = "";
+                    conv->firstVisibleIndex = -1;
                 } else {
-                    appendConversationMessage(gActiveConversation,
-                                              true,
-                                              String("[send failed] ") + inputBuffer,
-                                              gMesh.myNodeNum(),
-                                              false,
-                                              MessageDeliveryState::FAILED);
+                    sendFeedback = gMesh.lastError().length() > 0 ? gMesh.lastError() : "Send failed; draft kept";
                 }
-
-                inputBuffer = "";
-                // Jump to bottom to show the sent message
-                conv->firstVisibleIndex = -1;
             }
             break;
 
@@ -2766,13 +2768,16 @@ public:
     void handleChars(const std::vector<char>& chars) override {
         for (char c : chars) {
             if (c == '\b') {
-                // Backspace: delete last input character
+                // Backspace removes the previous UTF-8 codepoint, not just its last byte.
                 if (inputBuffer.length() > 0) {
-                    inputBuffer.remove(inputBuffer.length() - 1);
+                    size_t start = previousUtf8Boundary(inputBuffer.c_str(), inputBuffer.length(), inputBuffer.length());
+                    inputBuffer.remove(start);
                 }
+                sendFeedback = "";
             } else if (c >= 32 && c <= 126) {
                 // Printable ASCII character
                 inputBuffer += c;
+                sendFeedback = "";
             }
         }
     }
@@ -2806,8 +2811,13 @@ public:
             drawDisplayText(d, title, kColorHeaderText);
             d.println();
             d.setCursor(4, 14);
-            d.println(gStorageError.length() ? "SD WARNING - check history" :
-                      "FN + ;/. SCROLL  | DEL BACK");
+            String status = sendFeedback;
+            if (status.length() == 0 && inputBuffer.length() > kMaxMessageTextBytes) {
+                status = String("Too long: ") + String(inputBuffer.length()) + "/" + String(kMaxMessageTextBytes) + " B";
+            } else if (status.length() == 0) {
+                status = gStorageError.length() ? "SD WARNING - check history" : "FN + ;/. SCROLL  | DEL BACK";
+            }
+            drawDisplayText(d, truncateToWidth(status, d.width() - 8, d), kColorHeaderText);
         }
 
         int maxRows = (bottomY - topY) / lineH;
@@ -2849,13 +2859,39 @@ public:
             y += lineH;
         }
 
-        // Input line at bottom: show the buffer
+        // Composer: reserve space for the byte counter and show the suffix at
+        // the end of the draft so the active cursor never scrolls off-screen.
         d.fillRect(0, h - inputH, w, inputH, kColorFooterBg);
         d.drawFastHLine(0, h - inputH, w, kColorSeparator);
+        String prompt = gMesh.readyToSend() ? String("> ") : String("[not ready] ");
+        String counter = String(inputBuffer.length()) + "/" + String(kMaxMessageTextBytes) + "B";
+        int promptWidth = d.textWidth(prompt);
+        int counterWidth = d.textWidth(counter);
+        int cursorWidth = d.textWidth("_");
+        int textX = 2 + promptWidth;
+        int counterX = w - 2 - counterWidth;
+        int availableTextWidth = counterX - textX - cursorWidth - 2;
+        if (availableTextWidth < 0) availableTextWidth = 0;
+
+        size_t visibleStart = inputBuffer.length();
+        const int ellipsisWidth = d.textWidth("...");
+        while (visibleStart > 0) {
+            size_t candidateStart = previousUtf8Boundary(inputBuffer.c_str(), inputBuffer.length(), visibleStart);
+            String candidate = mapSpanishGlyphsForDisplay(inputBuffer.substring(candidateStart), true);
+            int hiddenPrefixWidth = candidateStart > 0 ? ellipsisWidth : 0;
+            if (d.textWidth(candidate) + hiddenPrefixWidth > availableTextWidth) break;
+            visibleStart = candidateStart;
+        }
+
         d.setTextColor(kColorFooterText, kColorFooterBg);
         d.setCursor(2, h - inputH + 1);
-        d.print(gMesh.readyToSend() ? "> " : "[not ready] ");
-        d.print(inputBuffer);
+        d.print(prompt);
+        if (visibleStart > 0) d.print("...");
+        drawDisplayText(d, mapSpanishGlyphsForDisplay(inputBuffer.substring(visibleStart), true), kColorFooterText);
+        d.print("_");
+        d.setTextColor(inputBuffer.length() > kMaxMessageTextBytes ? RED : kColorFooterText, kColorFooterBg);
+        d.setCursor(counterX, h - inputH + 1);
+        d.print(counter);
     }
 
     bool isInputEmpty() const {
@@ -3049,6 +3085,7 @@ private:
     }
 
     String inputBuffer;
+    String sendFeedback;
 };
 
 // -------------------- ScreenManager implementation --------------------

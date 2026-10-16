@@ -1,4 +1,5 @@
 #include "MeshtasticClient.h"
+#include "MessageTextPolicy.h"
 
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
@@ -6,6 +7,9 @@
 #include <pb_decode.h>
 #include <pb_encode.h>
 #include "meshtastic/mesh.pb.h"
+
+static_assert(kMaxMessageTextBytes <= meshtastic_Constants_DATA_PAYLOAD_LEN,
+              "Cardtastic message limit must fit in the generated Meshtastic payload");
 
 extern MeshtasticClient gMesh;
 
@@ -1439,10 +1443,19 @@ bool MeshtasticClient::sendTextMessage(const String& text,
         _lastError = "Empty message";
         return false;
     }
+    if (!messageTextFits(text.length())) {
+        _lastError = String("Message too long (max ") + String(kMaxMessageTextBytes) + " bytes)";
+        return false;
+    }
+    if (!isValidUtf8(text.c_str(), text.length())) {
+        _lastError = "Message is not valid UTF-8";
+        return false;
+    }
     if (!readyToSend()) {
         _lastError = "Radio not ready";
         return false;
     }
+    _lastError = "";
 
     meshtastic_ToRadio tr = meshtastic_ToRadio_init_zero;
     tr.which_payload_variant = meshtastic_ToRadio_packet_tag;
@@ -1460,10 +1473,13 @@ bool MeshtasticClient::sendTextMessage(const String& text,
     // ReliableRouter uses explicit ACKs for DMs and implicit ACK/retries for broadcasts.
     pkt.want_ack = true;
 
-    size_t maxLen = sizeof(pkt.decoded.payload.bytes);
-    size_t len = (text.length() > maxLen) ? maxLen : text.length();
+    size_t len = text.length();
+    if (!copyMessageTextPayload(text.c_str(), len, pkt.decoded.payload.bytes,
+                                sizeof(pkt.decoded.payload.bytes))) {
+        _lastError = "Message payload rejected";
+        return false;
+    }
     pkt.decoded.payload.size = static_cast<pb_size_t>(len);
-    memcpy(pkt.decoded.payload.bytes, text.c_str(), len);
 
     Serial.printf("[Mesh] TX packet: id=%lu from=0x%08lX to=0x%08lX ch=%u port=%u payload=%u/%u want_ack=%d want_response=%d\n",
                   (unsigned long)pkt.id,
