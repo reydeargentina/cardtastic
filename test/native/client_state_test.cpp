@@ -1,7 +1,44 @@
 #include "ClientState.h"
+#include "StoragePolicy.h"
 
 #include <assert.h>
 #include <stdio.h>
+#include <string>
+#include <vector>
+
+static void storagePolicy() {
+    StorageRetrySchedule retry;
+    assert(retry.due(0));
+    retry.failed(100);
+    assert(!retry.due(3099));
+    assert(retry.due(3100));
+    retry.failed(3100);
+    assert(!retry.due(9099));
+    assert(retry.due(9100));
+    retry.succeeded();
+    assert(retry.due(9100));
+    retry.failed(UINT32_MAX - 1000);
+    assert(!retry.due(UINT32_MAX - 1));
+    assert(retry.due(1999));
+
+    std::vector<std::string> persisted = {"one", "two"};
+    std::vector<std::string> memory = {"two", "three"};
+    mergeStorageHistories(persisted, memory, 10,
+        [](const std::string& a, const std::string& b) { return a == b; });
+    assert((persisted == std::vector<std::string>{"one", "two", "three"}));
+
+    std::vector<std::string> empty;
+    std::vector<std::string> fresh = {"ram-1", "ram-2"};
+    mergeStorageHistories(empty, fresh, 10,
+        [](const std::string& a, const std::string& b) { return a == b; });
+    assert(empty == fresh);
+
+    std::vector<std::string> disjoint = {"disk-1", "disk-2"};
+    std::vector<std::string> ram = {"ram-1", "ram-2"};
+    mergeStorageHistories(disjoint, ram, 3,
+        [](const std::string& a, const std::string& b) { return a == b; });
+    assert((disjoint == std::vector<std::string>{"disk-2", "ram-1", "ram-2"}));
+}
 
 static void finiteAttempts(bool writeFails, uint32_t now) {
     MeshConfigSync sync;
@@ -194,6 +231,7 @@ static void radioIdentityIsolation() {
 }
 
 int main() {
+    storagePolicy();
     synchronization();
     eventQueue();
     lifecycle();

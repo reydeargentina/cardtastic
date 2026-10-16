@@ -14,7 +14,8 @@ Coverage: finite retry budgets for failed writes and missing responses, explicit
 retry, nonce correlation, disconnect invalidation, inactivity versus total
 timeout, `millis()` rollover, control-event FIFO, ring wrap/overflow and terminal
 recovery, coalesced notifications/logs, session admission and deferred reuse,
-and radio identity transitions independent of SD availability.
+radio identity transitions independent of SD availability, storage retry backoff
+including rollover, and RAM/SD history overlap merging.
 
 The queue is deliberately externally synchronized in production. These tests
 validate its policy, not FreeRTOS scheduling or NimBLE's internals.
@@ -74,6 +75,24 @@ validate its policy, not FreeRTOS scheduling or NimBLE's internals.
   must remain untouched and must not be loaded automatically for either radio.
 - If the namespaced destination already exists, it is authoritative; migration
   must not overwrite it with the legacy file.
+
+## microSD recovery checks (issue #6)
+
+- Fill/remove the card during conversation and node-cache writes. The current
+  final file or backup must remain valid; partial temporaries must not replace
+  it. The UI reports an SD warning while chat and reception continue in RAM.
+- Interrupt power between writing the verified temporary, renaming the old
+  final to `.bak`, and promoting the temporary. On reboot, a valid temporary
+  or backup is recovered; corrupt files remain preserved as `.corrupt*`.
+- Inject open, short-write, rename and read/parse failures. Verify the old
+  history remains readable, the error is logged/shown, and retries are delayed
+  rather than repeated on every main-loop iteration.
+- Start with SD unavailable, receive messages in RAM, then insert a card with
+  an existing history for that radio. The RAM and SD sequences merge using the
+  longest exact SD-suffix/RAM-prefix overlap; non-overlapping records are kept,
+  and the merged snapshot is eventually saved.
+- Remove/reinsert the card after storage was loaded. Verify reloading and
+  reconciliation do not erase new RAM messages or silently replace history.
 
 Record radio firmware version and serial logs. A native pass and a successful
 firmware build do not replace these hardware checks.

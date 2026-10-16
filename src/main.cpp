@@ -9,6 +9,7 @@
 #include <NimBLEDevice.h> 
 #include <string>
 #include "MeshtasticClient.h"
+#include "StoragePolicy.h"
 #include "meshtastic/channel.pb.h"
 
 // -------------------- Basic navigation --------------------
@@ -386,6 +387,7 @@ struct Conversation {
     int                  firstVisibleIndex;  // -1 = auto-bottom (line index)
     bool                 hasUnread;
     uint32_t             lastActivitySeq;
+    bool                 storageDirty = false;
 };
 
 struct CachedNodeIdentity {
@@ -404,10 +406,13 @@ static ConnectionStatus gLastRenderedConnectionStatus = ConnectionStatus::DISCON
 static bool gLastRenderedConfigComplete = false;
 static String gLastRenderedSessionStatus;
 static String gLastRenderedError;
+static String gLastRenderedStorageError;
 
 constexpr uint32_t kNodeActiveMs = 5UL * 60UL * 1000UL;
 static bool gSdReady = false;
-static uint32_t gLastSdAttemptMs = 0;
+static StorageRetrySchedule gStorageRetry;
+static String gStorageError;
+static bool gStorageWarningSticky = false;
 static bool gStorageLoaded = false;
 static uint32_t gLoadedRadioNode = 0;
 static uint32_t gConversationRadioNode = 0;
@@ -463,12 +468,35 @@ bool initStorage() {
     return true;
 }
 
+void storageFailure(const char* operation) {
+    uint32_t now = millis();
+    gSdReady = false;
+    gStorageLoaded = false;
+    gLoadedRadioNode = 0;
+    gNodeIdentityCacheLoaded = false;
+    gStorageError = String("SD ") + operation;
+    gStorageRetry.failed(now);
+    Serial.printf("[Storage] %s failed; retry scheduled\n", operation);
+}
+
+void storageSuccess() {
+    gStorageRetry.succeeded();
+    if (!gStorageWarningSticky) gStorageError = "";
+    gSdReady = true;
+}
+
 bool ensureStorage() {
     if (gSdReady) return true;
     uint32_t now = millis();
-    if (now - gLastSdAttemptMs < 3000) return false;
-    gLastSdAttemptMs = now;
+    if (!gStorageRetry.due(now)) return false;
     gSdReady = initStorage();
+    if (gSdReady) {
+        storageSuccess();
+    } else {
+        gStorageError = "SD unavailable";
+        gStorageRetry.failed(now);
+        Serial.println("[Storage] SD mount failed; retry scheduled");
+    }
     return gSdReady;
 }
 
@@ -493,9 +521,137 @@ bool ensureRadioStorage(uint32_t radioNode) {
         File dir = SD.open(path);
         bool valid = dir && dir.isDirectory();
         if (dir) dir.close();
+        if (!valid) storageFailure("radio directory check");
         return valid;
     }
-    return SD.mkdir(path);
+    if (!SD.mkdir(path)) {
+        storageFailure("directory creation");
+        return false;
+    }
+    return true;
+}
+
+bool validStorageJson(const String& path, uint32_t radioNode, bool identityCache) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) return false;
+    size_t capacity = f.size() * 2 + 512;
+    if (capacity < 2048) capacity = 2048;
+    size_t maximum = identityCache ? 49152 : kConversationJsonMax;
+    if (capacity > maximum) capacity = maximum;
+    DynamicJsonDocument doc(capacity);
+    DeserializationError error = deserializeJson(doc, f);
+    f.close();
+    if (error || doc.overflowed() || (doc["radio"] | uint32_t{0}) != radioNode) return false;
+    return identityCache ? !doc["nodes"].as<JsonArray>().isNull()
+                         : !doc["messages"].as<JsonArray>().isNull();
+}
+
+bool preserveInvalidStorageFile(const String& path) {
+    if (!SD.exists(path)) return true;
+    String preserved = path + ".corrupt";
+    for (unsigned suffix = 1; SD.exists(preserved) && suffix < 100; ++suffix) {
+        preserved = path + ".corrupt" + String(suffix);
+    }
+    return !SD.exists(preserved) && SD.rename(path, preserved);
+}
+
+bool recoverStorageFile(const String& path, uint32_t radioNode, bool identityCache) {
+    if (validStorageJson(path, radioNode, identityCache)) return true;
+    String temporary = path + ".tmp";
+    String backup = path + ".bak";
+    String candidate;
+    // A fully validated temporary is the newest complete transaction when the
+    // final path is missing/corrupt; otherwise retain the last valid backup.
+    if (validStorageJson(temporary, radioNode, identityCache)) candidate = temporary;
+    else if (validStorageJson(backup, radioNode, identityCache)) candidate = backup;
+    if (candidate.length() == 0) {
+        if (!SD.exists(path)) return true;
+        if (!preserveInvalidStorageFile(path)) return false;
+        gStorageWarningSticky = true;
+        gStorageError = "SD corrupt file preserved";
+        Serial.printf("[Storage] preserved invalid file: %s\n", path.c_str());
+        return true;
+    }
+    if (SD.exists(path)) {
+        if (!preserveInvalidStorageFile(path)) return false;
+        gStorageWarningSticky = true;
+        gStorageError = "SD corrupt file preserved";
+    }
+    if (!SD.rename(candidate, path)) return false;
+    Serial.printf("[Storage] recovered %s from %s\n", path.c_str(), candidate.c_str());
+    return validStorageJson(path, radioNode, identityCache);
+}
+
+bool writeJsonTransaction(const String& path,
+                          DynamicJsonDocument& doc,
+                          uint32_t radioNode,
+                          bool identityCache) {
+    if (!gStorageRetry.due(millis())) return false;
+    if (doc.overflowed()) {
+        gStorageError = "SD data too large";
+        gStorageRetry.failed(millis());
+        Serial.println("[Storage] JSON document overflow; write skipped");
+        return false;
+    }
+    if (!recoverStorageFile(path, radioNode, identityCache)) {
+        storageFailure("recovery");
+        return false;
+    }
+
+    String temporary = path + ".tmp";
+    String backup = path + ".bak";
+    if (SD.exists(temporary) && !SD.remove(temporary)) {
+        storageFailure("temporary cleanup");
+        return false;
+    }
+    File f = SD.open(temporary, FILE_WRITE);
+    if (!f) {
+        storageFailure("temporary open");
+        return false;
+    }
+    size_t expected = measureJson(doc);
+    size_t written = serializeJson(doc, f);
+    f.flush();
+    f.close();
+    File check = SD.open(temporary, FILE_READ);
+    bool complete = check && written == expected && check.size() == written;
+    if (check) check.close();
+    if (!complete || !validStorageJson(temporary, radioNode, identityCache)) {
+        SD.remove(temporary);
+        storageFailure("temporary verification");
+        return false;
+    }
+
+    if (SD.exists(path)) {
+        if (validStorageJson(path, radioNode, identityCache)) {
+            // The final file is valid, so replacing an older backup still
+            // leaves a complete copy on the card.
+            if (SD.exists(backup) && !SD.remove(backup)) {
+                storageFailure("backup cleanup");
+                return false;
+            }
+            if (!SD.rename(path, backup)) {
+                storageFailure("backup rename");
+                return false;
+            }
+        } else if (!preserveInvalidStorageFile(path)) {
+            storageFailure("corrupt file preservation");
+            return false;
+        }
+    }
+    if (!SD.rename(temporary, path)) {
+        if (!SD.exists(path) && SD.exists(backup)) SD.rename(backup, path);
+        storageFailure("commit rename");
+        return false;
+    }
+    if (!validStorageJson(path, radioNode, identityCache)) {
+        preserveInvalidStorageFile(path);
+        if (!SD.exists(path) && SD.exists(backup)) SD.rename(backup, path);
+        storageFailure("final verification");
+        return false;
+    }
+    storageSuccess();
+    return true;
 }
 
 bool loadNodeIdentityCache(uint32_t radioNode) {
@@ -510,16 +666,28 @@ bool loadNodeIdentityCache(uint32_t radioNode) {
     if (!ensureStorage()) return false;
 
     String path = nodeIdentityCachePath(radioNode);
+    if (!recoverStorageFile(path, radioNode, true)) {
+        storageFailure("identity cache recovery");
+        return false;
+    }
     if (SD.exists(path)) {
         File f = SD.open(path, FILE_READ);
-        if (!f) return false;
+        if (!f) {
+            storageFailure("identity cache open");
+            return false;
+        }
         size_t cap = f.size() * 2 + 512;
         if (cap < 2048) cap = 2048;
         if (cap > 49152) cap = 49152;
         DynamicJsonDocument doc(cap);
         DeserializationError err = deserializeJson(doc, f);
         f.close();
-        if (!err && (doc["radio"] | uint32_t{0}) == radioNode) {
+        if (err || doc.overflowed() || (doc["radio"] | uint32_t{0}) != radioNode ||
+            doc["nodes"].isNull()) {
+            storageFailure("identity cache read");
+            return false;
+        }
+        {
             JsonArray nodes = doc["nodes"].as<JsonArray>();
             for (JsonObject obj : nodes) {
                 CachedNodeIdentity identity;
@@ -543,6 +711,7 @@ bool loadNodeIdentityCache(uint32_t radioNode) {
     }
 
     gNodeIdentityCacheLoaded = true;
+    storageSuccess();
     return true;
 }
 
@@ -562,22 +731,8 @@ bool persistNodeIdentityCache() {
         obj["short"] = identity.shortName;
         obj["long"] = identity.longName;
     }
-    if (doc.overflowed()) return false;
-
     String path = nodeIdentityCachePath(radioNode);
-    String tempPath = path + ".tmp";
-    SD.remove(tempPath);
-    File f = SD.open(tempPath, FILE_WRITE);
-    if (!f) return false;
-    serializeJson(doc, f);
-    f.close();
-
-    if (SD.exists(path)) SD.remove(path);
-    if (!SD.rename(tempPath, path)) {
-        SD.remove(tempPath);
-        return false;
-    }
-    return true;
+    return writeJsonTransaction(path, doc, radioNode, true);
 }
 
 bool refreshNodeIdentityCache() {
@@ -689,6 +844,7 @@ void migrateLegacyConversations(uint32_t radioNode) {
             continue;
         }
         String sourcePath = String(f.name());
+        if (sourcePath.lastIndexOf('/') < 0) sourcePath = String(kStorageDir) + "/" + sourcePath;
         int slash = sourcePath.lastIndexOf('/');
         String baseName = slash >= 0 ? sourcePath.substring(slash + 1) : sourcePath;
         if (!baseName.endsWith(".json") || baseName.startsWith("nodes_")) {
@@ -726,6 +882,7 @@ void migrateLegacyConversations(uint32_t radioNode) {
             SD.remove(temporary);
             continue;
         }
+        size_t sourceSize = source.size();
         uint8_t buffer[256];
         bool copied = true;
         while (source.available()) {
@@ -747,7 +904,8 @@ void migrateLegacyConversations(uint32_t radioNode) {
         if (verify) {
             DynamicJsonDocument verifyDoc(capacity);
             DeserializationError verifyError = deserializeJson(verifyDoc, verify);
-            verified = !verifyError && (verifyDoc["radio"] | uint32_t{0}) == radioNode &&
+            verified = verify.size() == sourceSize && !verifyError &&
+                       (verifyDoc["radio"] | uint32_t{0}) == radioNode &&
                        (verifyDoc["peer"] | uint32_t{0}) == (doc["peer"] | uint32_t{0}) &&
                        (verifyDoc["broadcast"] | false) == isBroadcast &&
                        (verifyDoc["channel"] | 0) == channel;
@@ -764,11 +922,49 @@ void migrateLegacyConversations(uint32_t radioNode) {
     dir.close();
 }
 
-void persistConversation(int convIndex) {
+bool recoverRadioConversations(uint32_t radioNode) {
+    String directoryPath = radioStoragePath(radioNode);
+    File dir = SD.open(directoryPath);
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        return false;
+    }
+    std::vector<String> paths;
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        if (f.isDirectory()) {
+            f.close();
+            continue;
+        }
+        String candidate = String(f.name());
+        if (candidate.lastIndexOf('/') < 0) candidate = directoryPath + "/" + candidate;
+        f.close();
+        String path = candidate;
+        if (candidate.endsWith(".json.tmp")) path = candidate.substring(0, candidate.length() - 4);
+        else if (candidate.endsWith(".json.bak")) path = candidate.substring(0, candidate.length() - 4);
+        else if (!candidate.endsWith(".json")) continue;
+        bool alreadyListed = false;
+        for (const String& existing : paths) {
+            if (existing == path) {
+                alreadyListed = true;
+                break;
+            }
+        }
+        if (!alreadyListed) paths.push_back(path);
+    }
+    dir.close();
+    for (const String& path : paths) {
+        if (!recoverStorageFile(path, radioNode, false)) return false;
+    }
+    return true;
+}
+
+bool persistConversation(int convIndex) {
     uint32_t radio = gMesh.myNodeNum();
-    if (radio == 0 || radio != gConversationRadioNode || !ensureRadioStorage(radio)) return;
+    if (radio == 0 || radio != gConversationRadioNode) return false;
     Conversation* conv = getConversation(convIndex);
-    if (!conv) return;
+    if (!conv) return false;
+    conv->storageDirty = true;
+    if (!ensureRadioStorage(radio)) return false;
 
     DynamicJsonDocument doc(kConversationJsonMax);
     doc["version"] = 1;
@@ -791,33 +987,31 @@ void persistConversation(int convIndex) {
     }
 
     String path = conversationFilePath(*conv);
-    if (SD.exists(path)) {
-        SD.remove(path);
-    }
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) {
-        gSdReady = false;
-        gStorageLoaded = false;
-        return;
-    }
-    serializeJson(doc, f);
-    f.close();
+    if (!writeJsonTransaction(path, doc, radio, false)) return false;
+    conv->storageDirty = false;
+    return true;
 }
 
-void loadConversationsFromStorage() {
-    if (!ensureStorage()) return;
+bool loadConversationsFromStorage() {
+    if (!ensureStorage()) return false;
     uint32_t currentRadio = gMesh.myNodeNum();
-    if (currentRadio == 0 || currentRadio != gConversationRadioNode || !ensureRadioStorage(currentRadio)) return;
+    if (currentRadio == 0 || currentRadio != gConversationRadioNode || !ensureRadioStorage(currentRadio)) return false;
     migrateLegacyConversations(currentRadio);
+    if (!recoverRadioConversations(currentRadio)) {
+        storageFailure("conversation recovery");
+        return false;
+    }
     uint32_t maxActivity = 0;
 
     String radioDir = radioStoragePath(currentRadio);
     File dir = SD.open(radioDir);
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
-        return;
+        storageFailure("conversation directory read");
+        return false;
     }
 
+    bool hadReadError = false;
     for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
         if (f.isDirectory()) {
             f.close();
@@ -838,7 +1032,9 @@ void loadConversationsFromStorage() {
 
         DeserializationError err = deserializeJson(doc, f);
         f.close();
-        if (err) {
+        if (err || doc.overflowed()) {
+            hadReadError = true;
+            Serial.printf("[Storage] invalid conversation file: %s\n", baseName.c_str());
             continue;
         }
 
@@ -856,7 +1052,13 @@ void loadConversationsFromStorage() {
         if (peer == 0) {
             continue;
         }
-        if (radio != 0 && currentRadio != 0 && radio != currentRadio) {
+        if (radio != currentRadio) {
+            continue;
+        }
+        JsonArray msgs = doc["messages"].as<JsonArray>();
+        if (msgs.isNull()) {
+            hadReadError = true;
+            Serial.printf("[Storage] missing message array: %s\n", baseName.c_str());
             continue;
         }
 
@@ -864,44 +1066,56 @@ void loadConversationsFromStorage() {
         Conversation* conv = getConversation(convIndex);
         if (!conv) continue;
 
-        if (!conv->messages.empty()) {
-            continue;
-        }
+        std::vector<Message> inMemory = conv->messages;
+        bool memoryUnread = conv->hasUnread;
+        uint32_t memoryActivity = conv->lastActivitySeq;
 
         conv->peer = peer;
         conv->isBroadcast = isBroadcast;
         conv->channel = channel;
         conv->messages.clear();
-        conv->hasUnread = unread;
+        conv->hasUnread = unread || memoryUnread;
         conv->firstVisibleIndex = -1;
 
-        JsonArray msgs = doc["messages"].as<JsonArray>();
-        if (msgs.isNull()) continue;
+        std::vector<Message> fromStorage;
         for (JsonObject obj : msgs) {
             Message m;
             m.from = obj["from"] | uint32_t{0};
             m.fromMe = obj["fromMe"] | false;
             const char* txt = obj["text"] | "";
             m.text = String(txt);
-            conv->messages.push_back(m);
+            fromStorage.push_back(m);
         }
-
-        if (conv->messages.size() > kConversationMaxMessages) {
-            size_t remove = conv->messages.size() - kConversationMaxMessages;
-            conv->messages.erase(conv->messages.begin(), conv->messages.begin() + remove);
-        }
+        conv->messages.swap(fromStorage);
+        mergeStorageHistories(conv->messages, inMemory, kConversationMaxMessages,
+            [](const Message& a, const Message& b) {
+                return a.from == b.from && a.fromMe == b.fromMe && a.text == b.text;
+            });
+        conv->storageDirty = !inMemory.empty();
         if (!hasLastActivity && !conv->messages.empty()) {
             lastActivity = 1;
         }
-        conv->lastActivitySeq = lastActivity;
+        conv->lastActivitySeq = lastActivity > memoryActivity ? lastActivity : memoryActivity;
         if (lastActivity > maxActivity) {
-            maxActivity = lastActivity;
+            maxActivity = conv->lastActivitySeq;
         }
     }
     dir.close();
+    // Keep valid conversations available even if one file was corrupt, but
+    // do not report the storage load complete if any read failed. Retry after
+    // backoff; recovery will preserve invalid files or restore their backup.
+    if (hadReadError) {
+        gStorageError = "SD history read error";
+        Serial.println("[Storage] one or more conversations could not be read");
+        storageFailure("conversation read");
+        return false;
+    } else {
+        storageSuccess();
+    }
     if (maxActivity >= gNextActivitySeq) {
         gNextActivitySeq = maxActivity + 1;
     }
+    return true;
 }
 
 bool tryLoadConversationsOnce() {
@@ -925,10 +1139,19 @@ bool tryLoadConversationsOnce() {
     if (gStorageLoaded && gLoadedRadioNode == currentRadio) return changed || identitiesLoaded;
     if (!ensureStorage()) return changed || identitiesLoaded;
 
+    if (!loadConversationsFromStorage()) return changed || identitiesLoaded;
     gLoadedRadioNode = currentRadio;
-    loadConversationsFromStorage();
     gStorageLoaded = true;
     return true;
+}
+
+void flushDirtyConversations() {
+    if (gMesh.myNodeNum() == 0 || gMesh.myNodeNum() != gConversationRadioNode ||
+        !gStorageRetry.due(millis())) return;
+    for (size_t i = 0; i < gConversations.size(); ++i) {
+        if (!gConversations[i].storageDirty) continue;
+        if (!persistConversation(static_cast<int>(i))) return;
+    }
 }
 
 void applyRadioStateTransition(uint32_t radioNode) {
@@ -2313,7 +2536,7 @@ public:
             d.setTextColor(kColorFooterText, kColorFooterBg);
             int h = d.height();
             d.setCursor(4, h - kFooterH + 1);
-            d.print("Backspace/Left: back");
+            d.print(gStorageError.length() ? "SD WARNING - check history" : "Backspace/Left: back");
             return;
         }
 
@@ -2337,7 +2560,7 @@ public:
             d.setTextColor(kColorFooterText, kColorFooterBg);
             int h = d.height();
             d.setCursor(4, h - kFooterH + 1);
-            d.print("Backspace/Left: back");
+            d.print(gStorageError.length() ? "SD WARNING - check history" : "Backspace/Left: back");
             return;
         }
 
@@ -2376,7 +2599,8 @@ public:
         d.setTextColor(kColorFooterText, kColorFooterBg);
         int h = d.height();
         d.setCursor(4, h - kFooterH + 1);
-        d.print("Arrows/W,S: move  Enter/Right: open  Backspace/Left: back");
+        d.print(gStorageError.length() ? "SD WARNING - check history" :
+                "Arrows/W,S: move  Enter/Right: open  Backspace/Left: back");
     }
 
     int getSelectedConversationIndex() const {
@@ -2582,7 +2806,8 @@ public:
             drawDisplayText(d, title, kColorHeaderText);
             d.println();
             d.setCursor(4, 14);
-            d.println("FN + ;/. SCROLL  | DEL BACK");
+            d.println(gStorageError.length() ? "SD WARNING - check history" :
+                      "FN + ;/. SCROLL  | DEL BACK");
         }
 
         int maxRows = (bottomY - topY) / lineH;
@@ -3042,6 +3267,8 @@ void ScreenManager::loop() {
     gLastRenderedConfigComplete = gMesh.configComplete();
     gLastRenderedSessionStatus = gMesh.sessionStatusLabel();
     gLastRenderedError = gMesh.lastError();
+    if (gLastRenderedStorageError != gStorageError) needRedraw = true;
+    gLastRenderedStorageError = gStorageError;
 
     if (tryLoadConversationsOnce()) {
         needRedraw = true;
@@ -3049,6 +3276,7 @@ void ScreenManager::loop() {
     if (refreshNodeIdentityCache()) {
         needRedraw = true;
     }
+    flushDirtyConversations();
 
     MeshDeliveryUpdate deliveryUpdate;
     while (gMesh.popDeliveryUpdate(deliveryUpdate)) {
@@ -3273,7 +3501,13 @@ void setup() {
     gMesh.begin();     // init BLE
     gScreens.begin();
     gSdReady = initStorage();
-    gLastSdAttemptMs = millis();
+    if (gSdReady) {
+        storageSuccess();
+    } else {
+        gStorageError = "SD unavailable";
+        gStorageRetry.failed(millis());
+        Serial.println("[Storage] initial SD mount failed; retry scheduled");
+    }
     gLastInputMs = millis();
     tryLoadConversationsOnce();
     gMesh.connectToLastDevice();
