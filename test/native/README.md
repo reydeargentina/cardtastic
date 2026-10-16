@@ -15,7 +15,8 @@ retry, nonce correlation, disconnect invalidation, inactivity versus total
 timeout, `millis()` rollover, control-event FIFO, ring wrap/overflow and terminal
 recovery, coalesced notifications/logs, session admission and deferred reuse,
 radio identity transitions independent of SD availability, storage retry backoff
-including rollover, and RAM/SD history overlap merging.
+including rollover, RAM/SD history overlap merging, the shared message-byte limit,
+UTF-8 validation, and codepoint-safe backspace boundaries.
 
 The queue is deliberately externally synchronized in production. These tests
 validate its policy, not FreeRTOS scheduling or NimBLE's internals.
@@ -93,6 +94,18 @@ validate its policy, not FreeRTOS scheduling or NimBLE's internals.
   and the merged snapshot is eventually saved.
 - Remove/reinsert the card after storage was loaded. Verify reloading and
   reconciliation do not erase new RAM messages or silently replace history.
+
+## Message size checks (issue #7)
+
+- Verify 199, 200, and 201 UTF-8 bytes: only the first two are sendable; the
+  client rejects excess without writing a packet or adding a history entry.
+- Verify multibyte text at exactly 200 bytes and one byte over. The counter is
+  byte-based, backspace removes a whole UTF-8 codepoint, and the visible editor
+  suffix never starts inside a codepoint.
+- Force a BLE write failure at the limit. The draft stays editable, the failed
+  payload is not recorded as a sent chat message, and retrying after correction
+  records exactly the bytes accepted by the client.
+- Long drafts keep their final text and cursor visible beside the counter.
 
 Record radio firmware version and serial logs. A native pass and a successful
 firmware build do not replace these hardware checks.
