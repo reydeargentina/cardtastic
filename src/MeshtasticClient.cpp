@@ -2,6 +2,7 @@
 #include "MessageTextPolicy.h"
 
 #include <Preferences.h>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
 #include <pb_decode.h>
@@ -183,7 +184,6 @@ MeshtasticClient::MeshtasticClient()
       _nextPacketId(1),
       _lastPollMs(0),
       _lastFromNum(0),
-      _awaitingQueueStatus(),
       _pendingDeliveries(),
       _deliveryUpdates(),
       _client(nullptr),
@@ -225,11 +225,11 @@ void MeshtasticClient::begin() {
     _myNodeNum      = 0;
     _needsPull      = false;
     _sync.reset();
-    _nextPacketId   = 1;
+    _nextPacketId   = esp_random();
+    if (_nextPacketId == 0) _nextPacketId = 1;
     _lastPollMs     = 0;
     _lastFromNum    = 0;
     _rxTextQueue.clear();
-    _awaitingQueueStatus.clear();
     _pendingDeliveries.clear();
     _deliveryUpdates.clear();
     _devices.clear();
@@ -886,12 +886,11 @@ void MeshtasticClient::updateKnownDeviceName(const String& id, const String& nam
 }
 
 void MeshtasticClient::resetConnectionState(bool clearNodes) {
-    // Delivery tokens from one BLE session cannot remain pending in another.
+    // Missing an ACK at disconnect is inconclusive, not an explicit failure.
     for (const auto& pending : _pendingDeliveries) {
-        _deliveryUpdates.push_back({pending.token, MeshDeliveryStage::FAILED});
+        _deliveryUpdates.push_back({pending.token, MeshDeliveryStage::DISCONNECTED});
     }
     _pendingDeliveries.clear();
-    _awaitingQueueStatus.clear();
 
     _svc           = nullptr;
     _charToRadio   = nullptr;
@@ -905,7 +904,6 @@ void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _myNodeNum      = 0;
     _needsPull      = false;
     _sync.reset();
-    _nextPacketId   = 1;
     _lastPollMs     = 0;
     _lastFromNum    = 0;
     _rxTextQueue.clear();
@@ -1260,21 +1258,6 @@ void MeshtasticClient::handleQueueStatus(uint32_t packetId, int result) {
         }
     }
 
-    if (pending == _pendingDeliveries.end()) {
-        while (!_awaitingQueueStatus.empty()) {
-            uint32_t token = _awaitingQueueStatus.front();
-            _awaitingQueueStatus.pop_front();
-            for (auto it = _pendingDeliveries.begin(); it != _pendingDeliveries.end(); ++it) {
-                if (it->token == token && it->packetId == 0) {
-                    it->packetId = packetId;
-                    pending = it;
-                    break;
-                }
-            }
-            if (pending != _pendingDeliveries.end()) break;
-        }
-    }
-
     if (pending == _pendingDeliveries.end()) return;
 
     Serial.printf("[Mesh] Delivery tracking: token=%lu packet_id=%lu queue_result=%d\n",
@@ -1282,7 +1265,7 @@ void MeshtasticClient::handleQueueStatus(uint32_t packetId, int result) {
                   (unsigned long)packetId,
                   result);
     if (result != 0) {
-        finishDelivery(pending->token, MeshDeliveryStage::FAILED);
+        finishDelivery(pending->token, MeshDeliveryStage::QUEUE_REJECTED);
     }
 }
 
@@ -1301,7 +1284,7 @@ void MeshtasticClient::handleRoutingResult(uint32_t packetId,
                           (unsigned long)it->token,
                           (unsigned long)packetId,
                           errorReason);
-            finishDelivery(it->token, MeshDeliveryStage::FAILED);
+            finishDelivery(it->token, MeshDeliveryStage::ROUTING_FAILED);
             return;
         }
 
@@ -1335,13 +1318,6 @@ void MeshtasticClient::finishDelivery(uint32_t token, MeshDeliveryStage stage) {
             break;
         }
     }
-    for (auto it = _awaitingQueueStatus.begin(); it != _awaitingQueueStatus.end();) {
-        if (*it == token) {
-            it = _awaitingQueueStatus.erase(it);
-        } else {
-            ++it;
-        }
-    }
 }
 
 void MeshtasticClient::expirePendingDeliveries(uint32_t now) {
@@ -1355,7 +1331,7 @@ void MeshtasticClient::expirePendingDeliveries(uint32_t now) {
         Serial.printf("[Mesh] Delivery timeout: token=%lu packet_id=%lu\n",
                       (unsigned long)token,
                       (unsigned long)_pendingDeliveries[i].packetId);
-        finishDelivery(token, MeshDeliveryStage::FAILED);
+        finishDelivery(token, MeshDeliveryStage::TIMED_OUT);
         i = 0;
     }
 }
@@ -1464,8 +1440,10 @@ bool MeshtasticClient::sendTextMessage(const String& text,
     pkt = meshtastic_MeshPacket_init_zero;
     pkt.to = dest;
     pkt.channel = channel;
-    // Let the node assign a unique packet ID to avoid PhoneAPI duplicate filtering.
-    pkt.id = 0;
+    // Explicit IDs let QueueStatus and Routing results match this send exactly.
+    // Keep the counter across BLE reconnects; zero is reserved by Meshtastic.
+    pkt.id = _nextPacketId++;
+    if (pkt.id == 0) pkt.id = _nextPacketId++;
 
     pkt.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
     pkt.decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
@@ -1504,11 +1482,10 @@ bool MeshtasticClient::sendTextMessage(const String& text,
     if (ok && deliveryToken != 0) {
         PendingDelivery pending;
         pending.token = deliveryToken;
-        pending.packetId = 0;
+        pending.packetId = pkt.id;
         pending.destination = dest;
         pending.startedMs = millis();
         _pendingDeliveries.push_back(pending);
-        _awaitingQueueStatus.push_back(deliveryToken);
     }
     Serial.printf("[Mesh] Send text len=%u -> %s\n",
                   (unsigned)len,
