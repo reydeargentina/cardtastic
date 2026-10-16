@@ -13,7 +13,8 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic -Isrc test/native/client_state_te
 Coverage: finite retry budgets for failed writes and missing responses, explicit
 retry, nonce correlation, disconnect invalidation, inactivity versus total
 timeout, `millis()` rollover, control-event FIFO, ring wrap/overflow and terminal
-recovery, coalesced notifications/logs, session admission and deferred reuse.
+recovery, coalesced notifications/logs, session admission and deferred reuse,
+and radio identity transitions independent of SD availability.
 
 The queue is deliberately externally synchronized in production. These tests
 validate its policy, not FreeRTOS scheduling or NimBLE's internals.
@@ -41,6 +42,22 @@ validate its policy, not FreeRTOS scheduling or NimBLE's internals.
   individual synchronous GATT operations may take longer.
 - Request a scan while connected: the link closes first; scanning is available
   on the next selection, without changing active device indexes underneath BLE.
+
+## Radio/session checks (issue #4)
+
+- Change radio A -> B with SD and without SD. A's conversations, cached node
+  names, unread state, active chat and selected node must not appear under B.
+- Disconnect from A with a chat open, then reconnect to A: the chat/draft and
+  node selection must be cleared, while A's conversations remain available.
+- Disconnect from A without SD and connect to B: B starts with only its own
+  in-RAM broadcast conversation; received packets are not assigned until its
+  node identity is known. Return to A and verify the runtime model is loaded
+  from A's SD history when present.
+- Try to leave a chat open over disconnect and press Enter: no packet is sent
+  and no file is saved without a current radio identity.
+- Start a DM, disconnect before ACK, and reconnect/switch radio: its pending
+  delivery ends as failed in the original radio's runtime history, never updates
+  a message on the other radio.
 
 Record radio firmware version and serial logs. A native pass and a successful
 firmware build do not replace these hardware checks.

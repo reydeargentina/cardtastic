@@ -882,6 +882,13 @@ void MeshtasticClient::updateKnownDeviceName(const String& id, const String& nam
 }
 
 void MeshtasticClient::resetConnectionState(bool clearNodes) {
+    // Delivery tokens from one BLE session cannot remain pending in another.
+    for (const auto& pending : _pendingDeliveries) {
+        _deliveryUpdates.push_back({pending.token, MeshDeliveryStage::FAILED});
+    }
+    _pendingDeliveries.clear();
+    _awaitingQueueStatus.clear();
+
     _svc           = nullptr;
     _charToRadio   = nullptr;
     _charFromRadio = nullptr;

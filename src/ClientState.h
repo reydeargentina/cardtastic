@@ -97,6 +97,37 @@ public:
     void release() { active = closing = terminalSeen = false; }
 };
 
+enum class RadioStateTransition { UNCHANGED, IDENTITY_CHANGED, DISCONNECTED, RECONNECTED };
+
+// Tracks radio identity independently from microSD availability or UI screen.
+class RadioIdentityTracker {
+public:
+    RadioStateTransition observe(uint32_t radioNode) {
+        if (radioNode == 0) {
+            if (!_connected) return RadioStateTransition::UNCHANGED;
+            _connected = false;
+            return RadioStateTransition::DISCONNECTED;
+        }
+        if (radioNode != _radioNode) {
+            _radioNode = radioNode;
+            _connected = true;
+            return RadioStateTransition::IDENTITY_CHANGED;
+        }
+        if (!_connected) {
+            _connected = true;
+            return RadioStateTransition::RECONNECTED;
+        }
+        return RadioStateTransition::UNCHANGED;
+    }
+
+    uint32_t radioNode() const { return _radioNode; }
+    bool connected() const { return _connected; }
+
+private:
+    uint32_t _radioNode = 0;
+    bool _connected = false;
+};
+
 enum class MeshBleEventType { CONNECTED, CONNECT_FAILED, DISCONNECTED, AUTH, PASSKEY, FROM_NUM, LOG };
 
 struct MeshBleEvent {
