@@ -54,6 +54,17 @@ monitor_port = /dev/serial/by-id/your-cardputer
 3. Select the radio to connect. If it requests a BLE passkey, enter the PIN shown by the radio; an existing bond may connect without prompting.
 4. Wait for the initial node and channel synchronization to finish, then open **Conversations**, **Channels**, or **Nodes**.
 
+The status distinguishes **AUTH**, **ENTER PIN**, **SYNC**, and **CONNECTED**.
+Messages can be sent only after synchronization completes; pressing Enter while
+the radio is not ready keeps the chat draft intact. Configuration synchronization
+stops after four failed attempts. If **SYNC FAILED** appears, press **R** on the
+**Connect** screen to start another cycle. Each attempt allows four seconds
+without configuration progress, with a maximum duration of 30 seconds.
+
+Connection changes wait for the previous BLE attempt to finish closing. To scan
+while connected, select **Scan for devices** to disconnect, then select it again
+after the link closes.
+
 Cardtastic is intended for messaging with an already-configured node. Configure region, channels, and frequencies with the Meshtastic app; Cardtastic does not modify those settings.
 
 ## Controls
@@ -61,6 +72,7 @@ Cardtastic is intended for messaging with an already-configured node. Configure 
 - **Menus:** Arrow keys or W/S to move; Enter or Right to select; Backspace or Left to go back.
 - **Chat:** Type to compose and press Enter to send. Backspace edits the draft.
 - **Chat scrolling:** Hold FN and press `;` to scroll up or `.` to scroll down. Hold Shift for page scrolling.
+- **Connect:** Press A to toggle startup auto-connect, or R to restart configuration synchronization on an authenticated connection.
 - **Delete/back:** In the connection list, Backspace deletes the selected entry; FN+Backspace goes back.
 
 ## Conversation storage

@@ -1,0 +1,46 @@
+# Native client-state regressions
+
+These tests exercise the same dependency-free state helpers used by the firmware.
+They do not require PlatformIO, an Arduino mock, or a connected board.
+
+From the repository root on Linux:
+
+```sh
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic -Isrc test/native/client_state_test.cpp -o /tmp/cardtastic-client-state-test
+/tmp/cardtastic-client-state-test
+```
+
+Coverage: finite retry budgets for failed writes and missing responses, explicit
+retry, nonce correlation, disconnect invalidation, inactivity versus total
+timeout, `millis()` rollover, control-event FIFO, ring wrap/overflow and terminal
+recovery, coalesced notifications/logs, session admission and deferred reuse.
+
+The queue is deliberately externally synchronized in production. These tests
+validate its policy, not FreeRTOS scheduling or NimBLE's internals.
+
+## Hardware integration checklist (issues #2 and #3)
+
+- First pairing with six-digit PIN (including leading zeroes), wrong PIN,
+  existing bond, cancellation and pairing timeout. The PIN screen should exit
+  when the request is no longer active.
+- Radio missing at startup; three bounded auto-connect attempts. Manual connect
+  remains available afterwards.
+- Cancel a pending connection, then immediately choose the same/another radio.
+  The new attempt must wait for the old stack terminal event and cleanup.
+- Disconnect during authentication, GATT discovery, config request/read and
+  sending. No crash, unexpected cleared model or stale event applied to a new link.
+- Sync succeeds only for the current config nonce with a known local node ID.
+  Use a test radio/transport to suppress completion or reject writes: four attempts
+  then SYNC FAILED. R in Connect starts another bounded cycle.
+- A large node database with ongoing config progress must not hit the four-second
+  inactivity timeout, but each attempt still has a 30-second total limit.
+- While AUTH/SYNC/SYNC FAILED, Enter in chat preserves the draft without sending.
+  After a valid sync the same draft can be sent.
+- Continuous traffic/notifications must not starve keyboard or lifecycle events.
+  Reception yields after eight records or approximately 30 ms between GATT calls;
+  individual synchronous GATT operations may take longer.
+- Request a scan while connected: the link closes first; scanning is available
+  on the next selection, without changing active device indexes underneath BLE.
+
+Record radio firmware version and serial logs. A native pass and a successful
+firmware build do not replace these hardware checks.

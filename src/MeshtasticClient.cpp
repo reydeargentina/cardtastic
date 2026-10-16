@@ -15,10 +15,35 @@ constexpr int kScanSeconds = 8;
 constexpr uint8_t kMaxAutoConnectAttempts = 3;
 constexpr uint32_t kAutoConnectAttemptTimeoutMs = 15000;
 constexpr uint32_t kAutoConnectRetryDelaysMs[] = {1000, 2500};
-constexpr uint8_t kMaxConfigAttempts = 4;
-constexpr uint32_t kConfigRetryMs = 1000;
-constexpr uint32_t kConfigRequestTimeoutMs = 4000;
 constexpr size_t kScanObservationCapacity = 24;
+constexpr uint32_t kAuthenticationTimeoutMs = 60000;
+constexpr uint32_t kTransportCloseTimeoutMs = 10000;
+
+MeshBleEventBuffer gBleEvents;
+portMUX_TYPE gBleEventMux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t gCallbackSession = 0;
+
+// GAP callbacks are serialized by the NimBLE host. A session is changed only
+// after its terminal callback AND the stack's disconnect cleanup have finished.
+void queueBleEvent(MeshBleEvent event) {
+    portENTER_CRITICAL(&gBleEventMux);
+    event.session = gCallbackSession;
+    gBleEvents.push(event);
+    portEXIT_CRITICAL(&gBleEventMux);
+}
+
+void queueNotification(MeshBleEvent event) {
+    portENTER_CRITICAL(&gBleEventMux);
+    gBleEvents.push(event); // subscription captures its immutable session
+    portEXIT_CRITICAL(&gBleEventMux);
+}
+
+bool popBleEvent(MeshBleEvent& event) {
+    portENTER_CRITICAL(&gBleEventMux);
+    bool found = gBleEvents.pop(event);
+    portEXIT_CRITICAL(&gBleEventMux);
+    return found;
+}
 
 struct ScanObservation {
     char address[18];
@@ -81,30 +106,41 @@ class MeshScanCallbacks : public NimBLEScanCallbacks {
 
 class MeshClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) override {
-        gMesh.handleConnect(pClient);
+        MeshBleEvent event;
+        event.type = MeshBleEventType::CONNECTED;
+        event.handle = pClient->getConnHandle();
+        queueBleEvent(event);
     }
 
     void onConnectFail(NimBLEClient* pClient, int reason) override {
-        gMesh.handleConnectFail(pClient, reason);
+        (void)pClient;
+        MeshBleEvent event;
+        event.type = MeshBleEventType::CONNECT_FAILED;
+        event.reason = reason;
+        queueBleEvent(event);
     }
 
     void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
-        Serial.println("[Mesh] Passkey requested");
-        gMesh.handlePasskeyRequest(connInfo);
+        MeshBleEvent event;
+        event.type = MeshBleEventType::PASSKEY;
+        event.handle = connInfo.getConnHandle();
+        queueBleEvent(event);
     }
 
     void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
-        Serial.printf("[Mesh] Auth complete: enc=%d auth=%d bond=%d\n",
-                      connInfo.isEncrypted() ? 1 : 0,
-                      connInfo.isAuthenticated() ? 1 : 0,
-                      connInfo.isBonded() ? 1 : 0);
-        gMesh.handleAuthComplete(connInfo);
+        MeshBleEvent event;
+        event.type = MeshBleEventType::AUTH;
+        event.handle = connInfo.getConnHandle();
+        event.encrypted = connInfo.isEncrypted();
+        queueBleEvent(event);
     }
 
     void onDisconnect(NimBLEClient* pClient, int reason) override {
-        (void)pClient;
-        Serial.printf("[Mesh] Disconnected (reason=%d)\n", reason);
-        gMesh.handleDisconnect(reason);
+        MeshBleEvent event;
+        event.type = MeshBleEventType::DISCONNECTED;
+        event.handle = pClient->getConnHandle();
+        event.reason = reason;
+        queueBleEvent(event);
     }
 };
 
@@ -139,11 +175,6 @@ MeshtasticClient::MeshtasticClient()
       _nextAutoConnectAttemptMs(0),
       _myNodeNum(0),
       _needsPull(false),
-      _configRequested(false),
-      _configComplete(false),
-      _configAttempts(0),
-      _configRequestMs(0),
-      _nextConfigAttemptMs(0),
       _nextPacketId(1),
       _lastPollMs(0),
       _lastFromNum(0),
@@ -188,11 +219,7 @@ void MeshtasticClient::begin() {
     _nextAutoConnectAttemptMs = 0;
     _myNodeNum      = 0;
     _needsPull      = false;
-    _configRequested = false;
-    _configComplete = false;
-    _configAttempts = 0;
-    _configRequestMs = 0;
-    _nextConfigAttemptMs = 0;
+    _sync.reset();
     _nextPacketId   = 1;
     _lastPollMs     = 0;
     _lastFromNum    = 0;
@@ -217,13 +244,22 @@ void MeshtasticClient::begin() {
 }
 
 void MeshtasticClient::loop() {
+    processBleEvents();
+    processTransportClose();
     uint32_t now = millis();
     processAutoConnectRetries(now);
-    if (!_client || !_client->isConnected()) {
+    if (_ble.closing || !_ble.active || !_client || !_client->isConnected()) {
         expirePendingDeliveries(now);
         return;
     }
 
+    if (_needsServiceDiscovery && now - _phaseStartedMs >= kAuthenticationTimeoutMs) {
+        _lastError = "Authentication timeout";
+        _status = ConnectionStatus::ERROR;
+        closeTransport();
+        scheduleAutoConnectRetry("authentication timeout");
+        return;
+    }
     if (_awaitingPasskey) {
         expirePendingDeliveries(now);
         return;
@@ -236,51 +272,25 @@ void MeshtasticClient::loop() {
         }
         _needsServiceDiscovery = false;
 
-        // Debug: dump all services
-        debugDumpServices();
-
         // Discover and subscribe to MeshBluetoothService
         if (!discoverMeshtasticService()) {
             Serial.println("[Mesh] discoverMeshtasticService() failed after connect");
-            if (_client && _client->isConnected()) {
-                _client->disconnect();
-            }
-            resetConnectionState(false);
             _status = ConnectionStatus::ERROR;
             _lastError = "Mesh service discovery failed";
+            closeTransport();
             scheduleAutoConnectRetry("Meshtastic service discovery failed");
             return;
         }
         saveLastConnectedDevice();
         _autoConnectStartup = false;
         _autoConnectRetryPending = false;
-        _configAttempts = 0;
-        _nextConfigAttemptMs = now;
+        _sync.start(millis());
     }
 
-    if (!_configComplete) {
-        if (_configRequested) {
-            if (_configRequestMs > 0 && (now - _configRequestMs) > kConfigRequestTimeoutMs) {
-                Serial.println("[Mesh] Config request timed out");
-                _configRequested = false;
-                _configRequestMs = 0;
-                _configAttempts++;
-                _nextConfigAttemptMs = now + kConfigRetryMs;
-                _lastError = "Config timeout";
-            }
-        } else if (_configAttempts < kMaxConfigAttempts && now >= _nextConfigAttemptMs) {
-            if (!requestConfig()) {
-                _configAttempts++;
-                _nextConfigAttemptMs = now + kConfigRetryMs;
-                Serial.printf("[Mesh] requestConfig failed (attempt %u/%u)\n",
-                              (unsigned)_configAttempts,
-                              (unsigned)kMaxConfigAttempts);
-                _lastError = "Config request failed";
-            }
-        }
-    }
+    if (_sync.due(millis())) requestConfig();
 
-    uint32_t pollIntervalMs = (_configRequested && !_configComplete) ? 50 : 1000;
+    uint32_t pollIntervalMs = _sync.phase == MeshSyncPhase::WAITING ? 50 : 1000;
+    now = millis();
     if (_needsPull) {
         _needsPull = false;
         pullFromRadioUntilEmpty(true);
@@ -290,7 +300,126 @@ void MeshtasticClient::loop() {
         _lastPollMs = now;
     }
 
+    // Read available responses before expiring the attempt. GATT calls can take
+    // time, so use a fresh clock rather than the value from the start of loop().
+    if (_sync.timedOut(millis())) {
+        _sync.failAttempt(millis());
+        _lastError = syncFailed() ? "Sync failed; R to retry" : "Sync timeout; retrying";
+    }
     expirePendingDeliveries(millis());
+}
+
+const char* MeshtasticClient::sessionStatusLabel() const {
+    if (_ble.closing) return _status == ConnectionStatus::ERROR ? "ERROR" : "CLOSING";
+    if (_status == ConnectionStatus::CONNECTED) {
+        if (_needsServiceDiscovery) return _awaitingPasskey ? "ENTER PIN" : "AUTH";
+        if (syncFailed()) return "SYNC FAILED";
+        return configComplete() ? "CONNECTED" : "SYNC";
+    }
+    switch (_status) {
+    case ConnectionStatus::DISCONNECTED: return "DISCONNECTED";
+    case ConnectionStatus::SCANNING: return "SCANNING";
+    case ConnectionStatus::CONNECTING: return "CONNECTING";
+    case ConnectionStatus::ERROR: return "ERROR";
+    default: return "UNKNOWN";
+    }
+}
+
+bool MeshtasticClient::readyToSend() const {
+    return !_ble.closing && isConnected() && _client && _client->isConnected() &&
+           _client->getConnInfo().isEncrypted() && _charToRadio &&
+           _myNodeNum != 0 && configComplete();
+}
+
+bool MeshtasticClient::retryConfig() {
+    if (_ble.closing || !isConnected() || _needsServiceDiscovery || !_charToRadio ||
+        !_client || !_client->isConnected() || !_client->getConnInfo().isEncrypted()) return false;
+    _lastError = "";
+    _sync.start(millis());
+    return true;
+}
+
+void MeshtasticClient::processBleEvents() {
+    portENTER_CRITICAL(&gBleEventMux);
+    bool overflow = gBleEvents.takeOverflow();
+    portEXIT_CRITICAL(&gBleEventMux);
+    if (overflow) {
+        cancelAutoConnectRetries();
+        _nextConnectIndex = -1;
+        _status = ConnectionStatus::ERROR;
+        _lastError = "BLE event overflow; reconnect";
+        closeTransport();
+    }
+    MeshBleEvent event;
+    for (size_t count = 0; count < MeshBleEventBuffer::capacity + 3 && popBleEvent(event); ++count) {
+        if (!_ble.accepts(event.session)) continue;
+        if (event.type == MeshBleEventType::DISCONNECTED ||
+            event.type == MeshBleEventType::CONNECT_FAILED) {
+            _ble.terminalSeen = true;
+            if (!_ble.closing) {
+                if (event.type == MeshBleEventType::DISCONNECTED) handleDisconnect(event.reason);
+                else handleConnectFail(event.reason);
+            }
+            _ble.closing = true;
+            _closeStartedMs = millis();
+            continue;
+        }
+        if (_ble.closing) {
+            if (event.type == MeshBleEventType::CONNECTED && _client->isConnected()) {
+                _client->disconnect(); // connect won a race with cancellation
+            }
+            continue;
+        }
+        if (event.type != MeshBleEventType::LOG && event.type != MeshBleEventType::FROM_NUM &&
+            (!_client->isConnected() || event.handle != _client->getConnHandle())) continue;
+        switch (event.type) {
+        case MeshBleEventType::CONNECTED: handleConnect(); break;
+        case MeshBleEventType::AUTH: handleAuthComplete(event.encrypted); break;
+        case MeshBleEventType::PASSKEY: handlePasskeyRequest(event.handle); break;
+        case MeshBleEventType::FROM_NUM:
+            _lastFromNum = event.fromNum;
+            _needsPull = true;
+            break;
+        case MeshBleEventType::LOG:
+            Serial.printf("[Mesh LOG] %s\n", event.log);
+            break;
+        default: break;
+        }
+    }
+}
+
+void MeshtasticClient::closeTransport() {
+    if (!_ble.active || _ble.closing) return;
+    _ble.closing = true;
+    _closeStartedMs = millis();
+    _sync.reset();
+    _awaitingPasskey = false;
+    _pendingPasskeyHandle = 0xFFFF;
+    if (_client->isConnected()) _client->disconnect();
+    else _client->cancelConnect();
+}
+
+void MeshtasticClient::processTransportClose() {
+    if (!_ble.closing) return;
+    if (_ble.canRelease(_client->isConnected())) {
+        // The disconnect callback precedes NimBLE clearing its connection handle.
+        // Never reconnect/delete attributes while that cleanup is still running.
+        _ble.release();
+        String error = _lastError;
+        ConnectionStatus status = _status;
+        resetConnectionState(false);
+        _lastError = error;
+        _status = status == ConnectionStatus::ERROR ? status : ConnectionStatus::DISCONNECTED;
+        int next = _nextConnectIndex;
+        _nextConnectIndex = -1;
+        if (next >= 0) startConnection(next);
+    } else if (millis() - _closeStartedMs >= kTransportCloseTimeoutMs) {
+        // Fail closed: do not recycle a client without a terminal stack event.
+        _nextConnectIndex = -1;
+        cancelAutoConnectRetries();
+        _status = ConnectionStatus::ERROR;
+        _lastError = "BLE close timeout; restart device";
+    }
 }
 
 // ---- Scan and devices ----
@@ -348,6 +477,13 @@ bool MeshtasticClient::ingestScanObservation(const char* address,
 }
 
 void MeshtasticClient::startScan() {
+    // The UI may request a scan during connect/pairing. Finish closing first;
+    // do not mutate the device-index mapping under an active connection.
+    if (_ble.active || _ble.closing) {
+        disconnect();
+        _lastError = "Disconnecting; scan again";
+        return;
+    }
     _devices.clear();
     ScanObservation staleObservation;
     while (popScanObservation(staleObservation)) {
@@ -652,10 +788,11 @@ void MeshtasticClient::scheduleAutoConnectRetry(const char* reason) {
 
 void MeshtasticClient::processAutoConnectRetries(uint32_t now) {
     if (!_autoConnectStartup || !_autoConnectEnabled) return;
+    if (_ble.closing) return;
     if (_awaitingPasskey) return;
 
     if (_autoConnectRetryPending) {
-        if (now >= _nextAutoConnectAttemptMs) {
+        if (meshDeadlineReached(now, _nextAutoConnectAttemptMs)) {
             attemptAutoConnect();
         }
         return;
@@ -668,14 +805,7 @@ void MeshtasticClient::processAutoConnectRetries(uint32_t now) {
     }
 
     Serial.println("[Mesh] Auto-connect attempt timed out");
-    if (_client) {
-        if (_client->isConnected()) {
-            _client->disconnect();
-        } else {
-            _client->cancelConnect();
-        }
-    }
-    resetConnectionState(false);
+    closeTransport();
     _status = ConnectionStatus::ERROR;
     _lastError = "Auto-connect timeout";
     scheduleAutoConnectRetry("attempt timeout");
@@ -762,11 +892,7 @@ void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _radioName      = "";
     _myNodeNum      = 0;
     _needsPull      = false;
-    _configRequested = false;
-    _configComplete = false;
-    _configAttempts = 0;
-    _configRequestMs = 0;
-    _nextConfigAttemptMs = 0;
+    _sync.reset();
     _nextPacketId   = 1;
     _lastPollMs     = 0;
     _lastFromNum    = 0;
@@ -824,11 +950,21 @@ bool MeshtasticClient::discoverMeshtasticService() {
 
     // --- Subscribe to FromNum (packet counter) ---
     if (_charFromNum->canNotify()) {
-        auto cbFromNum = [this](NimBLERemoteCharacteristic* chr,
+        const uint32_t session = _ble.id;
+        auto cbFromNum = [session](NimBLERemoteCharacteristic* chr,
                                 uint8_t* data,
                                 size_t   len,
                                 bool     isNotify) {
-            this->handleFromNumNotify(chr, data, len, isNotify);
+            (void)chr;
+            (void)isNotify;
+            MeshBleEvent event;
+            event.type = MeshBleEventType::FROM_NUM;
+            event.session = session;
+            if (data && len >= 4) {
+                event.fromNum = uint32_t(data[0]) | (uint32_t(data[1]) << 8) |
+                                (uint32_t(data[2]) << 16) | (uint32_t(data[3]) << 24);
+            }
+            queueNotification(event);
         };
 
         if (_charFromNum->subscribe(true, cbFromNum, true)) {
@@ -842,11 +978,19 @@ bool MeshtasticClient::discoverMeshtasticService() {
 
     // --- Subscribe to LogRecord (optional, debug only) ---
     if (_charLog && _charLog->canNotify()) {
-        auto cbLog = [this](NimBLERemoteCharacteristic* chr,
+        const uint32_t session = _ble.id;
+        auto cbLog = [session](NimBLERemoteCharacteristic* chr,
                             uint8_t* data,
                             size_t   len,
                             bool     isNotify) {
-            this->handleLogNotify(chr, data, len, isNotify);
+            (void)chr;
+            (void)isNotify;
+            MeshBleEvent event;
+            event.type = MeshBleEventType::LOG;
+            event.session = session;
+            size_t count = len < sizeof(event.log) - 1 ? len : sizeof(event.log) - 1;
+            if (data) memcpy(event.log, data, count);
+            queueNotification(event);
         };
 
         if (_charLog->subscribe(true, cbLog, true)) {
@@ -868,13 +1012,6 @@ bool MeshtasticClient::connectToIndex(int index) {
         _status    = ConnectionStatus::ERROR;
         return false;
     }
-    _authFailed = false;
-
-    if (_client && _client->isConnected() && _status != ConnectionStatus::CONNECTED) {
-        Serial.println("[Mesh] Client connected while status not CONNECTED, disconnecting");
-        disconnect();
-    }
-
     // Toggle: if already connected to this index, disconnect
     if (_status == ConnectionStatus::CONNECTED && _connectedIndex == index) {
         Serial.println("[Mesh] Already connected to this index, toggling -> disconnect");
@@ -882,15 +1019,17 @@ bool MeshtasticClient::connectToIndex(int index) {
         return true;
     }
 
-    if (_status == ConnectionStatus::CONNECTING && _client) {
-        _client->cancelConnect();
+    if (_ble.active || _ble.closing) {
+        _nextConnectIndex = index;
+        closeTransport();
+        return true;
     }
+    return startConnection(index);
+}
 
-    // If connected to another device, disconnect first
-    if (_status == ConnectionStatus::CONNECTED && _connectedIndex != index) {
-        Serial.println("[Mesh] Was connected to other index, disconnecting first");
-        disconnect();
-    }
+bool MeshtasticClient::startConnection(int index) {
+    if (index < 0 || index >= (int)_devices.size()) return false;
+    resetConnectionState(true);
 
     MeshDeviceInfo info = _devices[index];
 
@@ -910,7 +1049,19 @@ bool MeshtasticClient::connectToIndex(int index) {
         _client = NimBLEDevice::createClient();
         Serial.println("[Mesh] Created new NimBLEClient");
     }
+    if (!_client) {
+        _status = ConnectionStatus::ERROR;
+        _lastError = "No BLE client available";
+        return false;
+    }
     _client->setClientCallbacks(&gClientCallbacks, false);
+    _client->setSelfDelete(false, false);
+    _client->setConnectTimeout(10);
+    if (!_ble.begin()) return false;
+    portENTER_CRITICAL(&gBleEventMux);
+    gCallbackSession = _ble.id;
+    portEXIT_CRITICAL(&gBleEventMux);
+    _phaseStartedMs = millis();
 
     // Build address from string "00:4b:12:b1:19:f6"
     std::string addrStr(info.id.c_str());
@@ -919,6 +1070,7 @@ bool MeshtasticClient::connectToIndex(int index) {
     // Async connect to keep UI responsive during pairing
     bool ok = _client->connect(addr, true, true);
     if (!ok) {
+        _ble.release();
         Serial.println("[Mesh] client->connect(async) returned false");
         _status               = ConnectionStatus::ERROR;
         _lastError            = "Connect failed";
@@ -984,16 +1136,9 @@ void MeshtasticClient::debugDumpServices() {
 void MeshtasticClient::disconnect() {
     Serial.println("[Mesh] Disconnect requested");
 
-    if (_client) {
-        if (_client->isConnected()) {
-            Serial.println("[Mesh] Calling client->disconnect()");
-            _client->disconnect();
-        } else if (_status == ConnectionStatus::CONNECTING) {
-            Serial.println("[Mesh] Cancelling pending connect");
-            _client->cancelConnect();
-        }
-    }
-
+    cancelAutoConnectRetries();
+    _nextConnectIndex = -1;
+    closeTransport();
     resetConnectionState(false);
     _lastError = "";
 }
@@ -1017,8 +1162,8 @@ void MeshtasticClient::handleDisconnect(int reason) {
     }
 }
 
-void MeshtasticClient::handleConnect(NimBLEClient* pClient) {
-    if (!pClient || !pClient->isConnected()) {
+void MeshtasticClient::handleConnect() {
+    if (!_client || !_client->isConnected()) {
         _status = ConnectionStatus::ERROR;
         _lastError = "Connect failed";
         _pendingConnectIndex = -1;
@@ -1035,24 +1180,24 @@ void MeshtasticClient::handleConnect(NimBLEClient* pClient) {
     _awaitingPasskey = false;
     _pendingPasskeyHandle = 0xFFFF;
     _needsServiceDiscovery = true;
+    _phaseStartedMs = millis();
 
-    if (!pClient->secureConnection(true)) {
-        Serial.println("[Mesh] secureConnection async failed");
+    if (!_client->getConnInfo().isEncrypted() && !_client->secureConnection(true)) {
+        _status = ConnectionStatus::ERROR;
+        _lastError = "Could not start authentication";
+        closeTransport();
+        scheduleAutoConnectRetry("authentication start failed");
+        return;
     }
 
     _rxTextQueue.clear();
     _nodes.clear();
     _channels.clear();
     _needsPull = false;
-    _configRequested = false;
-    _configComplete = false;
-    _configAttempts = 0;
-    _configRequestMs = 0;
-    _nextConfigAttemptMs = 0;
+    _sync.reset();
 }
 
-void MeshtasticClient::handleConnectFail(NimBLEClient* pClient, int reason) {
-    (void)pClient;
+void MeshtasticClient::handleConnectFail(int reason) {
     Serial.printf("[Mesh] Connect failed (reason=%d)\n", reason);
     _status               = ConnectionStatus::ERROR;
     _lastError            = String("Connect failed (") + reason + ")";
@@ -1064,17 +1209,15 @@ void MeshtasticClient::handleConnectFail(NimBLEClient* pClient, int reason) {
     scheduleAutoConnectRetry("BLE connection failed");
 }
 
-void MeshtasticClient::handleAuthComplete(const NimBLEConnInfo& connInfo) {
+void MeshtasticClient::handleAuthComplete(bool encrypted) {
     _awaitingPasskey = false;
-    if (!connInfo.isEncrypted()) {
+    if (!encrypted) {
         _authFailed = true;
         _autoConnectStartup = false;
         _autoConnectRetryPending = false;
         _status = ConnectionStatus::ERROR;
         _lastError = "Auth failed";
-        if (_client && _client->isConnected()) {
-            _client->disconnect();
-        }
+        closeTransport();
     } else {
         _authFailed = false;
     }
@@ -1245,36 +1388,37 @@ bool MeshtasticClient::writeToRadio(const uint8_t* data, size_t len, const char*
 }
 
 bool MeshtasticClient::requestConfig() {
-    if (!_client || !_client->isConnected() || !_charToRadio) return false;
-    if (_configRequested) return true;
-
-    NimBLEConnInfo info = _client->getConnInfo();
-    if (!info.isEncrypted()) {
-        _client->secureConnection();
+    if (!_sync.beginAttempt(millis())) return false;
+    if (_ble.closing || !_client || !_client->isConnected() || !_charToRadio ||
+        !_client->getConnInfo().isEncrypted()) {
+        _sync.failAttempt(millis());
+        _lastError = syncFailed() ? "Sync failed; R to retry" : "Config link not ready";
+        return false;
     }
 
     meshtastic_ToRadio tr = meshtastic_ToRadio_init_zero;
     tr.which_payload_variant = meshtastic_ToRadio_want_config_id_tag;
-    tr.want_config_id = (uint32_t)millis();
+    tr.want_config_id = _sync.expectedId;
 
     uint8_t buf[meshtastic_ToRadio_size];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
     if (!pb_encode(&stream, &meshtastic_ToRadio_msg, &tr)) {
         Serial.printf("[Mesh] ToRadio(want_config) encode failed: %s\n", PB_GET_ERROR(&stream));
+        _sync.failAttempt(millis());
+        _lastError = syncFailed() ? "Sync failed; R to retry" : "Config encode failed";
         return false;
     }
 
     bool ok = writeToRadio(buf, stream.bytes_written, "Config");
     if (ok) {
-        _configRequested = true;
-        _configComplete = false;
         _needsPull = true;
-        _configRequestMs = millis();
-        _configAttempts = 0;
-        _nextConfigAttemptMs = 0;
-        if (_lastError.startsWith("Config")) {
-            _lastError = "";
-        }
+        _sync.progress(millis());
+        _lastError = "";
+        Serial.printf("[Mesh] Config attempt %u/%u id=%lu\n", _sync.attempts,
+                      MeshConfigSync::maxAttempts, (unsigned long)_sync.expectedId);
+    } else {
+        _sync.failAttempt(millis());
+        _lastError = syncFailed() ? "Sync failed; R to retry" : "Config write failed; retrying";
     }
     return ok;
 }
@@ -1287,14 +1431,9 @@ bool MeshtasticClient::sendTextMessage(const String& text,
         _lastError = "Empty message";
         return false;
     }
-    if (!_client || !_client->isConnected()) {
-        _lastError = "Not connected";
+    if (!readyToSend()) {
+        _lastError = "Radio not ready";
         return false;
-    }
-
-    NimBLEConnInfo info = _client->getConnInfo();
-    if (!info.isEncrypted()) {
-        _client->secureConnection();
     }
 
     meshtastic_ToRadio tr = meshtastic_ToRadio_init_zero;
@@ -1364,7 +1503,7 @@ void MeshtasticClient::clearPasskey() {
 }
 
 bool MeshtasticClient::submitPasskey(uint32_t passkey) {
-    if (_pendingPasskeyHandle == 0xFFFF) return false;
+    if (_ble.closing || !_awaitingPasskey || passkey > 999999 || _pendingPasskeyHandle == 0xFFFF) return false;
     NimBLEClient* client = NimBLEDevice::getClientByHandle(_pendingPasskeyHandle);
     if (!client || !client->isConnected()) {
         _pendingPasskeyHandle = 0xFFFF;
@@ -1376,54 +1515,21 @@ bool MeshtasticClient::submitPasskey(uint32_t passkey) {
     if (ok) {
         _awaitingPasskey = false;
         _pendingPasskeyHandle = 0xFFFF;
+        // Time spent typing the PIN must not consume the post-PIN auth budget.
+        _phaseStartedMs = millis();
+        _autoConnectAttemptStartedMs = _phaseStartedMs;
     }
     return ok;
 }
 
-void MeshtasticClient::handlePasskeyRequest(const NimBLEConnInfo& connInfo) {
+void MeshtasticClient::handlePasskeyRequest(uint16_t handle) {
+    _awaitingPasskey = true;
+    _pendingPasskeyHandle = handle;
     if (_autoPasskeyEnabled) {
         Serial.println("[Mesh] Auto passkey enabled, injecting");
-        NimBLEDevice::injectPassKey(connInfo, _autoPasskey);
+        submitPasskey(_autoPasskey);
         return;
     }
-    _awaitingPasskey = true;
-    _pendingPasskeyHandle = connInfo.getConnHandle();
-}
-
-// ---- Notifications ----
-
-void MeshtasticClient::handleFromNumNotify(NimBLERemoteCharacteristic* chr,
-                                           uint8_t* data, size_t len, bool isNotify)
-{
-    (void)chr;
-    (void)isNotify;
-
-    if (data && len >= 4) {
-        uint32_t val = (uint32_t)data[0] |
-                       ((uint32_t)data[1] << 8) |
-                       ((uint32_t)data[2] << 16) |
-                       ((uint32_t)data[3] << 24);
-        _lastFromNum = val;
-        Serial.printf("[Mesh] FromNum notify: %lu\n", (unsigned long)val);
-    } else {
-        Serial.println("[Mesh] FromNum notify");
-    }
-
-    _needsPull = true;
-}
-
-void MeshtasticClient::handleLogNotify(NimBLERemoteCharacteristic* chr,
-                                       uint8_t* data, size_t len, bool isNotify)
-{
-    (void)chr;
-    (void)isNotify;
-
-    String line;
-    for (size_t i = 0; i < len; ++i) {
-        line += static_cast<char>(data[i]);
-    }
-    Serial.print("[Mesh LOG] ");
-    Serial.println(line);
 }
 
 // ---- Drain FromRadio ----
@@ -1436,6 +1542,19 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
     if (!pb_decode(&stream, &meshtastic_FromRadio_msg, &fr)) {
         Serial.printf("[Mesh] FromRadio decode failed: %s\n", PB_GET_ERROR(&stream));
         return false;
+    }
+
+    // Ordinary mesh traffic or a stale completion is not synchronization progress.
+    switch (fr.which_payload_variant) {
+    case meshtastic_FromRadio_my_info_tag:
+    case meshtastic_FromRadio_node_info_tag:
+    case meshtastic_FromRadio_channel_tag:
+    case meshtastic_FromRadio_config_tag:
+    case meshtastic_FromRadio_moduleConfig_tag:
+    case meshtastic_FromRadio_metadata_tag:
+        _sync.progress(millis());
+        break;
+    default: break;
     }
 
     Serial.printf("[Mesh] FromRadio decoded: variant=%u len=%u\n",
@@ -1458,11 +1577,13 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
     }
 
     if (fr.which_payload_variant == meshtastic_FromRadio_config_complete_id_tag) {
-        _configComplete = true;
-        Serial.printf("[Mesh] Config complete (id=%lu)\n",
-                      (unsigned long)fr.config_complete_id);
-        if (_lastError.startsWith("Config")) {
+        if (_sync.complete(fr.config_complete_id, _myNodeNum != 0, millis())) {
             _lastError = "";
+            Serial.printf("[Mesh] Config complete (id=%lu)\n", (unsigned long)fr.config_complete_id);
+        } else {
+            Serial.printf("[Mesh] Ignored config completion id=%lu (expected=%lu phase=%d)\n",
+                          (unsigned long)fr.config_complete_id, (unsigned long)_sync.expectedId,
+                          static_cast<int>(_sync.phase));
         }
         return true;
     }
@@ -1641,13 +1762,17 @@ void MeshtasticClient::pullFromRadioUntilEmpty(bool logEmpty)
         return;
     }
 
-    while (true) {
+    // Bound this batch so lifecycle events, deadlines and keyboard get serviced.
+    const uint32_t started = millis();
+    for (unsigned packets = 0; packets < 8; ++packets) {
+        if (_ble.closing || !_client->isConnected()) return;
         std::string val = _charFromRadio->readValue();  // returns current buffer or empty
+        if (!_client->isConnected()) return;
         if (val.empty()) {
             if (logEmpty) {
                 Serial.println("[Mesh] FromRadio empty");
             }
-            break;
+            return;
         }
 
         Serial.printf("[Mesh] FromRadio %d bytes\n", (int)val.size());
@@ -1661,5 +1786,7 @@ void MeshtasticClient::pullFromRadioUntilEmpty(bool logEmpty)
             }
             Serial.println();
         }
+        if (millis() - started >= 30) break;
     }
+    _needsPull = true;
 }
