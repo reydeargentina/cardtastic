@@ -53,7 +53,11 @@ struct MeshTextMessage {
 enum class MeshDeliveryStage {
     MESH_CONFIRMED,
     DESTINATION_ACKED,
-    FAILED
+    QUEUE_REJECTED,
+    ROUTING_FAILED,
+    TIMED_OUT,
+    DISCONNECTED,
+    UNCONFIRMED
 };
 
 struct MeshDeliveryUpdate {
@@ -213,7 +217,6 @@ private:
         uint32_t destination;
         uint32_t startedMs;
     };
-    std::deque<uint32_t>        _awaitingQueueStatus;
     std::vector<PendingDelivery> _pendingDeliveries;
     std::deque<MeshDeliveryUpdate> _deliveryUpdates;
     std::vector<MeshDeviceInfo> _devices;

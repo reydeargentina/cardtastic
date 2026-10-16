@@ -27,7 +27,7 @@ enum class NavKey {
     TOGGLE_AUTOCONNECT
 };
 
-// -------------------- Conversation / Message model (RAM only for now) --------------------
+// -------------------- Conversation / Message model --------------------
 
 constexpr uint32_t kBroadcastAddr = 0xFFFFFFFF;
 constexpr size_t kConversationMaxMessages = 50;
@@ -369,7 +369,11 @@ enum class MessageDeliveryState {
     PENDING,
     MESH_CONFIRMED,
     DELIVERED,
-    FAILED
+    QUEUE_REJECTED,
+    FAILED,
+    TIMED_OUT,
+    DISCONNECTED,
+    UNCONFIRMED
 };
 
 struct Message {
@@ -985,6 +989,7 @@ bool persistConversation(int convIndex) {
         obj["from"] = msg.from;
         obj["fromMe"] = msg.fromMe;
         obj["text"] = msg.text;
+        obj["delivery"] = static_cast<uint8_t>(msg.delivery);
     }
 
     String path = conversationFilePath(*conv);
@@ -1070,6 +1075,7 @@ bool loadConversationsFromStorage() {
         std::vector<Message> inMemory = conv->messages;
         bool memoryUnread = conv->hasUnread;
         uint32_t memoryActivity = conv->lastActivitySeq;
+        bool migratedPendingDelivery = false;
 
         conv->peer = peer;
         conv->isBroadcast = isBroadcast;
@@ -1085,6 +1091,15 @@ bool loadConversationsFromStorage() {
             m.fromMe = obj["fromMe"] | false;
             const char* txt = obj["text"] | "";
             m.text = String(txt);
+            uint8_t delivery = obj["delivery"] | static_cast<uint8_t>(MessageDeliveryState::UNKNOWN);
+            if (delivery <= static_cast<uint8_t>(MessageDeliveryState::UNCONFIRMED)) {
+                m.delivery = static_cast<MessageDeliveryState>(delivery);
+            }
+            // Pending delivery tracking belongs to the previous process/session.
+            if (m.delivery == MessageDeliveryState::PENDING) {
+                m.delivery = MessageDeliveryState::UNCONFIRMED;
+                migratedPendingDelivery = true;
+            }
             fromStorage.push_back(m);
         }
         conv->messages.swap(fromStorage);
@@ -1092,7 +1107,7 @@ bool loadConversationsFromStorage() {
             [](const Message& a, const Message& b) {
                 return a.from == b.from && a.fromMe == b.fromMe && a.text == b.text;
             });
-        conv->storageDirty = !inMemory.empty();
+        conv->storageDirty = !inMemory.empty() || migratedPendingDelivery;
         if (!hasLastActivity && !conv->messages.empty()) {
             lastActivity = 1;
         }
@@ -1472,15 +1487,29 @@ void applyDeliveryUpdate(const MeshDeliveryUpdate& update) {
     case MeshDeliveryStage::DESTINATION_ACKED:
         state = MessageDeliveryState::DELIVERED;
         break;
-    case MeshDeliveryStage::FAILED:
+    case MeshDeliveryStage::QUEUE_REJECTED:
+        state = MessageDeliveryState::QUEUE_REJECTED;
+        break;
+    case MeshDeliveryStage::ROUTING_FAILED:
         state = MessageDeliveryState::FAILED;
+        break;
+    case MeshDeliveryStage::TIMED_OUT:
+        state = MessageDeliveryState::TIMED_OUT;
+        break;
+    case MeshDeliveryStage::DISCONNECTED:
+        state = MessageDeliveryState::DISCONNECTED;
+        break;
+    case MeshDeliveryStage::UNCONFIRMED:
+        state = MessageDeliveryState::UNCONFIRMED;
         break;
     }
 
-    for (auto& conv : gConversations) {
+    for (size_t convIndex = 0; convIndex < gConversations.size(); ++convIndex) {
+        auto& conv = gConversations[convIndex];
         for (auto& msg : conv.messages) {
             if (msg.deliveryToken == update.token) {
                 msg.delivery = state;
+                persistConversation(static_cast<int>(convIndex));
                 return;
             }
         }
@@ -2815,7 +2844,7 @@ public:
             if (status.length() == 0 && inputBuffer.length() > kMaxMessageTextBytes) {
                 status = String("Too long: ") + String(inputBuffer.length()) + "/" + String(kMaxMessageTextBytes) + " B";
             } else if (status.length() == 0) {
-                status = gStorageError.length() ? "SD WARNING - check history" : "FN + ;/. SCROLL  | DEL BACK";
+                status = gStorageError.length() ? "SD WARNING - check history" : "FN+;/. scroll DEL | ACK!=read";
             }
             drawDisplayText(d, truncateToWidth(status, d.width() - 8, d), kColorHeaderText);
         }
@@ -3051,7 +3080,7 @@ private:
             String label = msg.fromMe ? String("Me") : resolvedNodeLabel(msg.from);
             label = mapSpanishGlyphsForDisplay(label, true);
             String prefix = label + "> ";
-            size_t coloredPrefixLength = msg.fromMe ? 3 : 0;
+            size_t coloredPrefixLength = msg.fromMe ? prefix.length() : 0;
             uint16_t prefixColor = kColorBodyText;
             if (msg.fromMe) {
                 switch (msg.delivery) {
@@ -3066,6 +3095,14 @@ private:
                     break;
                 case MessageDeliveryState::FAILED:
                     prefixColor = RED;
+                    break;
+                case MessageDeliveryState::QUEUE_REJECTED:
+                    prefixColor = RED;
+                    break;
+                case MessageDeliveryState::UNCONFIRMED:
+                case MessageDeliveryState::TIMED_OUT:
+                case MessageDeliveryState::DISCONNECTED:
+                    prefixColor = ORANGE;
                     break;
                 case MessageDeliveryState::UNKNOWN:
                 default:
