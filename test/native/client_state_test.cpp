@@ -171,9 +171,32 @@ static void lifecycle() {
     assert(session.begin() && session.id == 1);
 }
 
+static void radioIdentityIsolation() {
+    RadioIdentityTracker radios;
+    assert(radios.radioNode() == 0 && !radios.connected());
+    assert(radios.observe(0) == RadioStateTransition::UNCHANGED);
+    assert(radios.observe(0xAABBCCDD) == RadioStateTransition::IDENTITY_CHANGED);
+    assert(radios.radioNode() == 0xAABBCCDD && radios.connected());
+    assert(radios.observe(0xAABBCCDD) == RadioStateTransition::UNCHANGED);
+    assert(radios.observe(0) == RadioStateTransition::DISCONNECTED);
+    assert(radios.radioNode() == 0xAABBCCDD && !radios.connected());
+    // Reconnecting to the same radio retains radio-owned conversations but
+    // the caller still clears session-only selections/drafts on DISCONNECTED.
+    assert(radios.observe(0xAABBCCDD) == RadioStateTransition::RECONNECTED);
+    assert(radios.observe(0x01020304) == RadioStateTransition::IDENTITY_CHANGED);
+    assert(radios.radioNode() == 0x01020304 && radios.connected());
+    // The transition policy contains no SD dependency: A -> no SD -> B always
+    // changes identity and tells the caller to discard A's RAM-owned model.
+    RadioIdentityTracker noSd;
+    assert(noSd.observe(10) == RadioStateTransition::IDENTITY_CHANGED);
+    assert(noSd.observe(0) == RadioStateTransition::DISCONNECTED);
+    assert(noSd.observe(20) == RadioStateTransition::IDENTITY_CHANGED);
+}
+
 int main() {
     synchronization();
     eventQueue();
     lifecycle();
+    radioIdentityIsolation();
     puts("client_state: all regression checks passed");
 }

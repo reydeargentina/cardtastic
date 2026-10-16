@@ -397,7 +397,7 @@ struct CachedNodeIdentity {
 static std::vector<Conversation> gConversations;
 static std::vector<CachedNodeIdentity> gCachedNodeIdentities;
 static int gActiveConversation = -1;
-static int gSelectedNodeIndex = -1;
+static uint32_t gSelectedNodeNum = 0;
 static uint32_t gNextActivitySeq = 1;
 static uint32_t gNextDeliveryToken = 1;
 static ConnectionStatus gLastRenderedConnectionStatus = ConnectionStatus::DISCONNECTED;
@@ -410,7 +410,10 @@ static bool gSdReady = false;
 static uint32_t gLastSdAttemptMs = 0;
 static bool gStorageLoaded = false;
 static uint32_t gLoadedRadioNode = 0;
+static uint32_t gConversationRadioNode = 0;
+static RadioIdentityTracker gRadioIdentity;
 static uint32_t gNodeIdentityCacheRadio = 0;
+static bool gNodeIdentityCacheLoaded = false;
 static bool gNodeIdentityCacheDirty = false;
 static uint32_t gLastInputMs = 0;
 static bool gScreenSleeping = false;
@@ -420,6 +423,9 @@ Conversation* getConversation(int index);
 int ensureConversation(uint32_t peer, bool isBroadcast, uint8_t channel);
 void initConversations();
 String resolvedNodeLabel(uint32_t nodeNum);
+void handleRadioIdentityChanged();
+void handleRadioDisconnected();
+void applyRadioStateTransition(uint32_t radioNode);
 
 bool initStorage() {
     int cs = M5.getPin(m5::sd_spi_cs);
@@ -477,38 +483,50 @@ String nodeIdentityCachePath(uint32_t radioNode) {
 }
 
 bool loadNodeIdentityCache(uint32_t radioNode) {
-    if (radioNode == 0 || gNodeIdentityCacheRadio == radioNode) return false;
+    if (radioNode == 0) return false;
+    if (gNodeIdentityCacheRadio != radioNode) {
+        gCachedNodeIdentities.clear();
+        gNodeIdentityCacheDirty = false;
+        gNodeIdentityCacheLoaded = false;
+        gNodeIdentityCacheRadio = radioNode;
+    }
+    if (gNodeIdentityCacheLoaded) return false;
     if (!ensureStorage()) return false;
 
-    gCachedNodeIdentities.clear();
-    gNodeIdentityCacheDirty = false;
     String path = nodeIdentityCachePath(radioNode);
     if (SD.exists(path)) {
         File f = SD.open(path, FILE_READ);
-        if (f) {
-            size_t cap = f.size() * 2 + 512;
-            if (cap < 2048) cap = 2048;
-            if (cap > 49152) cap = 49152;
-            DynamicJsonDocument doc(cap);
-            DeserializationError err = deserializeJson(doc, f);
-            f.close();
-            if (!err && (doc["radio"] | uint32_t{0}) == radioNode) {
-                JsonArray nodes = doc["nodes"].as<JsonArray>();
-                for (JsonObject obj : nodes) {
-                    CachedNodeIdentity identity;
-                    identity.nodeNum = obj["num"] | uint32_t{0};
-                    identity.shortName = obj["short"] | "";
-                    identity.longName = obj["long"] | "";
-                    if (identity.nodeNum != 0 &&
-                        (identity.shortName.length() > 0 || identity.longName.length() > 0)) {
+        if (!f) return false;
+        size_t cap = f.size() * 2 + 512;
+        if (cap < 2048) cap = 2048;
+        if (cap > 49152) cap = 49152;
+        DynamicJsonDocument doc(cap);
+        DeserializationError err = deserializeJson(doc, f);
+        f.close();
+        if (!err && (doc["radio"] | uint32_t{0}) == radioNode) {
+            JsonArray nodes = doc["nodes"].as<JsonArray>();
+            for (JsonObject obj : nodes) {
+                CachedNodeIdentity identity;
+                identity.nodeNum = obj["num"] | uint32_t{0};
+                identity.shortName = obj["short"] | "";
+                identity.longName = obj["long"] | "";
+                if (identity.nodeNum != 0 &&
+                    (identity.shortName.length() > 0 || identity.longName.length() > 0)) {
+                    auto existing = gCachedNodeIdentities.begin();
+                    while (existing != gCachedNodeIdentities.end() &&
+                           existing->nodeNum != identity.nodeNum) ++existing;
+                    if (existing == gCachedNodeIdentities.end()) {
                         gCachedNodeIdentities.push_back(identity);
+                    } else {
+                        if (existing->shortName.length() == 0) existing->shortName = identity.shortName;
+                        if (existing->longName.length() == 0) existing->longName = identity.longName;
                     }
                 }
             }
         }
     }
 
-    gNodeIdentityCacheRadio = radioNode;
+    gNodeIdentityCacheLoaded = true;
     return true;
 }
 
@@ -634,16 +652,14 @@ String conversationFilePath(const Conversation& conv) {
 }
 
 void persistConversation(int convIndex) {
-    if (!ensureStorage()) return;
+    uint32_t radio = gMesh.myNodeNum();
+    if (radio == 0 || radio != gConversationRadioNode || !ensureStorage()) return;
     Conversation* conv = getConversation(convIndex);
     if (!conv) return;
 
     DynamicJsonDocument doc(kConversationJsonMax);
     doc["version"] = 1;
-    uint32_t radio = gMesh.myNodeNum();
-    if (radio != 0) {
-        doc["radio"] = radio;
-    }
+    doc["radio"] = radio;
     doc["peer"] = conv->peer;
     doc["broadcast"] = conv->isBroadcast;
     doc["channel"] = conv->channel;
@@ -775,18 +791,48 @@ void loadConversationsFromStorage() {
 bool tryLoadConversationsOnce() {
     uint32_t currentRadio = gMesh.myNodeNum();
     if (currentRadio == 0) return false;
-    if (gStorageLoaded && gLoadedRadioNode == currentRadio) return false;
-    if (!ensureStorage()) return false;
-
-    if (gLoadedRadioNode != 0 && gLoadedRadioNode != currentRadio) {
+    bool changed = false;
+    if (gConversationRadioNode != currentRadio) {
+        // RAM state belongs to one radio even when there is no SD card.
         initConversations();
+        gCachedNodeIdentities.clear();
+        gNodeIdentityCacheRadio = 0;
+        gNodeIdentityCacheLoaded = false;
+        gNodeIdentityCacheDirty = false;
+        gStorageLoaded = false;
+        gLoadedRadioNode = 0;
+        gConversationRadioNode = currentRadio;
+        handleRadioIdentityChanged();
+        changed = true;
     }
+    bool identitiesLoaded = loadNodeIdentityCache(currentRadio);
+    if (gStorageLoaded && gLoadedRadioNode == currentRadio) return changed || identitiesLoaded;
+    if (!ensureStorage()) return changed || identitiesLoaded;
 
-    loadNodeIdentityCache(currentRadio);
     gLoadedRadioNode = currentRadio;
     loadConversationsFromStorage();
     gStorageLoaded = true;
     return true;
+}
+
+void applyRadioStateTransition(uint32_t radioNode) {
+    RadioStateTransition transition = gRadioIdentity.observe(radioNode);
+    if (transition == RadioStateTransition::DISCONNECTED) {
+        handleRadioDisconnected();
+        return;
+    }
+    if (transition != RadioStateTransition::IDENTITY_CHANGED) return;
+
+    // This reset is based on the radio's node ID, never on whether SD mounted.
+    initConversations();
+    gCachedNodeIdentities.clear();
+    gNodeIdentityCacheRadio = 0;
+    gNodeIdentityCacheLoaded = false;
+    gNodeIdentityCacheDirty = false;
+    gStorageLoaded = false;
+    gLoadedRadioNode = 0;
+    gConversationRadioNode = radioNode;
+    handleRadioIdentityChanged();
 }
 
 int findConversationIndex(uint32_t peer, bool isBroadcast, uint8_t channel) {
@@ -986,9 +1032,15 @@ void drawScanCountdown(int secondsLeft, int attempt, int attempts) {
 }
 
 bool getSelectedNodeInfo(MeshNodeInfo& out) {
-    if (gSelectedNodeIndex < 0 || gSelectedNodeIndex >= gMesh.getNodeCount()) return false;
-    out = gMesh.getNodeInfo(gSelectedNodeIndex);
-    return out.num != 0;
+    if (gSelectedNodeNum == 0) return false;
+    for (int i = 0; i < gMesh.getNodeCount(); ++i) {
+        MeshNodeInfo node = gMesh.getNodeInfo(i);
+        if (node.num == gSelectedNodeNum) {
+            out = node;
+            return true;
+        }
+    }
+    return false;
 }
 
 const char* connectionStatusLabel() {
@@ -1033,6 +1085,12 @@ void initConversations() {
     gNextActivitySeq = 1;
 }
 
+void invalidateRadioTransientState() {
+    gActiveConversation = -1;
+    gSelectedNodeNum = 0;
+    gPendingPinDeviceIndex = -1;
+}
+
 void appendConversationMessage(int convIndex,
                                bool fromMe,
                                const String& text,
@@ -1040,6 +1098,7 @@ void appendConversationMessage(int convIndex,
                                bool markUnread,
                                MessageDeliveryState delivery = MessageDeliveryState::UNKNOWN,
                                uint32_t deliveryToken = 0) {
+    if (gMesh.myNodeNum() == 0 || gMesh.myNodeNum() != gConversationRadioNode) return;
     Conversation* conv = getConversation(convIndex);
     if (!conv) return;
     bool autoBottom = (conv->firstVisibleIndex < 0);
@@ -1246,6 +1305,8 @@ public:
     void handleNav(NavKey k);
     void loop();
     void redrawCurrentScreenNow();
+    void handleRadioIdentityChanged();
+    void handleRadioDisconnected();
 
 private:
     ScreenId currentId;
@@ -1717,6 +1778,14 @@ public:
     int getSelectedNodeIndex() {
         rebuildList();
         if (nodeIndexMap.empty()) return -1;
+        if (gSelectedNodeNum != 0) {
+            for (int i = 0; i < (int)nodeIndexMap.size(); ++i) {
+                if (gMesh.getNodeInfo(nodeIndexMap[i]).num == gSelectedNodeNum) {
+                    menu.selected = i;
+                    return nodeIndexMap[i];
+                }
+            }
+        }
         int sel = menu.current();
         if (sel < 0 || sel >= (int)nodeIndexMap.size()) return -1;
         return nodeIndexMap[sel];
@@ -2195,6 +2264,7 @@ public:
     }
 
     int getSelectedConversationIndex() const {
+        if (!isRadioReady()) return -1;
         int sel = menu.current();
         if (sel < 0 || sel >= (int)convIndexMap.size()) return -1;
         return convIndexMap[sel];
@@ -2264,6 +2334,7 @@ public:
 
     void onExit() override {
         gActiveConversation = -1;
+        inputBuffer = "";
     }
 
     void handleNav(NavKey k) override {
@@ -2684,6 +2755,38 @@ void ScreenManager::switchTo(ScreenId id) {
     needRedraw = true;
 }
 
+void ScreenManager::handleRadioIdentityChanged() {
+    gSelectedNodeNum = 0;
+    gPendingPinDeviceIndex = -1;
+    if (currentId == ScreenId::CHAT || currentId == ScreenId::PIN_ENTRY ||
+        currentId == ScreenId::NODE_ACTIONS || currentId == ScreenId::NODE_INFO) {
+        switchTo(ScreenId::HOME);
+    } else {
+        needRedraw = true;
+    }
+}
+
+void ScreenManager::handleRadioDisconnected() {
+    gSelectedNodeNum = 0;
+    gPendingPinDeviceIndex = -1;
+    if (currentId == ScreenId::CHAT || currentId == ScreenId::PIN_ENTRY ||
+        currentId == ScreenId::NODE_ACTIONS || currentId == ScreenId::NODE_INFO) {
+        switchTo(ScreenId::HOME);
+    } else {
+        needRedraw = true;
+    }
+}
+
+void handleRadioIdentityChanged() {
+    invalidateRadioTransientState();
+    gScreens.handleRadioIdentityChanged();
+}
+
+void handleRadioDisconnected() {
+    invalidateRadioTransientState();
+    gScreens.handleRadioDisconnected();
+}
+
 void ScreenManager::handleNav(NavKey k) {
     if (!currentScreen) return;
 
@@ -2733,13 +2836,12 @@ void ScreenManager::handleNav(NavKey k) {
     if (currentId == ScreenId::CONVERSATIONS && k == NavKey::ENTER) {
         auto* cs = static_cast<ConversationsScreen*>(currentScreen);
         int convIndex = cs->getSelectedConversationIndex();
-        if (convIndex >= 0) {
-            gActiveConversation = convIndex;
-            Conversation* conv = getConversation(convIndex);
-            if (conv) {
-                conv->hasUnread = false;
-                persistConversation(convIndex);
-            }
+        if (convIndex < 0) return;
+        gActiveConversation = convIndex;
+        Conversation* conv = getConversation(convIndex);
+        if (conv) {
+            conv->hasUnread = false;
+            persistConversation(convIndex);
         }
         switchTo(ScreenId::CHAT);
         return;
@@ -2750,7 +2852,7 @@ void ScreenManager::handleNav(NavKey k) {
         auto* ns = static_cast<NodesScreen*>(currentScreen);
         int nodeIndex = ns->getSelectedNodeIndex();
         if (nodeIndex >= 0) {
-            gSelectedNodeIndex = nodeIndex;
+            gSelectedNodeNum = gMesh.getNodeInfo(nodeIndex).num;
             switchTo(ScreenId::NODE_ACTIONS);
         }
         return;
@@ -2802,6 +2904,8 @@ void ScreenManager::loop() {
         return;
     }
 
+    applyRadioStateTransition(gMesh.myNodeNum());
+
     if (currentId != ScreenId::PIN_ENTRY && gMesh.awaitingPasskey()) {
         gPendingPinDeviceIndex = gMesh.connectedDeviceIndex();
         switchTo(ScreenId::PIN_ENTRY);
@@ -2839,6 +2943,7 @@ void ScreenManager::loop() {
     bool gotMessage = false;
     MeshTextMessage msg;
     while (gMesh.popTextMessage(msg)) {
+        if (gMesh.myNodeNum() == 0 || gMesh.myNodeNum() != gConversationRadioNode) continue;
         bool isBroadcast = (msg.to == kBroadcastAddr || msg.to == 0);
         uint32_t sender = msg.from;
         if (!msg.fromMe && !isBroadcast && sender == 0) {
