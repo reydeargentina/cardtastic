@@ -45,9 +45,6 @@ constexpr uint16_t kColorFooterBg = DARKGREEN;
 constexpr uint16_t kColorFooterText = WHITE;
 constexpr uint16_t kColorSeparator = GREEN;
 constexpr int kFooterH = 10;
-static int gScanSecondsLeft = -1;
-static int gScanAttempt = 0;
-static int gScanAttempts = 0;
 
 uint32_t decodeUtf8Codepoint(const String& text, size_t index, size_t& byteCount) {
     const size_t length = text.length();
@@ -1419,19 +1416,6 @@ void drawHeaderRightStatus(const String& line1, const String& line2) {
     }
 }
 
-void drawScanCountdown(int secondsLeft, int attempt, int attempts) {
-    gScanSecondsLeft = secondsLeft;
-    gScanAttempt = attempt;
-    gScanAttempts = attempts;
-    if (secondsLeft < 0) {
-        drawHeaderRightStatus("", "");
-        return;
-    }
-    String line1 = String("Scan ") + secondsLeft + "s";
-    String line2 = String(attempt) + "/" + attempts;
-    drawHeaderRightStatus(line1, line2);
-}
-
 bool getSelectedNodeInfo(MeshNodeInfo& out) {
     if (gSelectedNodeNum == 0) return false;
     for (int i = 0; i < gMesh.getNodeCount(); ++i) {
@@ -1756,7 +1740,7 @@ public:
     void switchTo(ScreenId id);
     void handleNav(NavKey k);
     void loop();
-    void redrawCurrentScreenNow();
+    void drawConnectScanUpdates(bool redrawHeader, bool redrawDevices);
     void handleRadioIdentityChanged();
     void handleRadioDisconnected();
 
@@ -1781,7 +1765,6 @@ private:
 };
 
 extern ScreenManager gScreens;
-void redrawConnectScreenForScan();
 
 // -------------------- Home screen (list) --------------------
 
@@ -1870,6 +1853,21 @@ public:
         menu.reset();
     }
 
+    void onExit() override {
+        gMesh.cancelScan();
+    }
+
+    void drawScanUpdates(bool redrawHeader, bool redrawDevices) {
+        auto& d = M5Cardputer.Display;
+        if (redrawHeader) drawStatusHeader(d);
+        if (redrawDevices) {
+            const int startY = 28;
+            d.fillRect(0, startY - 2, d.width(), d.height() - kFooterH - startY + 2,
+                       kColorBodyBg);
+            drawDeviceRows(d);
+        }
+    }
+
     void handleNav(NavKey k) override {
         int itemCount = getItemCount();
 
@@ -1897,10 +1895,25 @@ public:
     void draw() override {
         auto& d = M5Cardputer.Display;
         d.fillScreen(kColorBodyBg);
-        const int headerH = 24;
-        drawHeaderBackground(headerH);
+        drawStatusHeader(d);
+        drawDeviceRows(d);
 
-        // --- Compact header: status only in two small lines ---
+        // --- Bottom help bar ---
+        d.setTextSize(1);
+        drawFooterBackground();
+        d.setTextColor(kColorFooterText, kColorFooterBg);
+        int h = d.height();
+        d.setCursor(4, h - kFooterH + 1);
+        String footer = String("A:Auto ") + (gMesh.autoConnectEnabled() ? "ON" : "OFF");
+        footer += gMesh.isScanning() ? " Enter:cancel Del:back" : " R:Sync Enter:select";
+        d.print(footer);
+    }
+
+private:
+    ListMenuState menu;
+
+    void drawStatusHeader(M5GFX& d) const {
+        drawHeaderBackground(24);
         d.setTextSize(1);
         d.setTextColor(kColorHeaderText, kColorHeaderBg);
         d.setCursor(4, 4);
@@ -1908,7 +1921,15 @@ public:
         d.println(gMesh.sessionStatusLabel());
 
         d.setCursor(4, 14);
-        if (gMesh.status() == ConnectionStatus::CONNECTED) {
+        if (gMesh.isScanning()) {
+            int seconds = gMesh.scanSecondsLeft();
+            if (gMesh.scanAttempt() == 0) {
+                d.print("Waiting for BLE to close...");
+            } else {
+                d.print(String("Scan ") + gMesh.scanAttempt() + "/3");
+                if (seconds >= 0) d.print(String("  ") + seconds + "s");
+            }
+        } else if (gMesh.status() == ConnectionStatus::CONNECTED) {
             if (gMesh.lastError().length() > 0) {
                 d.print("Warn: ");
                 d.println(gMesh.lastError());
@@ -1920,63 +1941,42 @@ public:
             d.print("Error: ");
             d.println(gMesh.lastError());
         } else {
-            int count = gMesh.getDeviceCount();
             d.print("Devices: ");
-            d.println(count);
+            d.println(gMesh.getDeviceCount());
         }
+    }
 
-        // --- List: Scan + devices ---
+    void drawDeviceRows(M5GFX& d) {
         d.setTextColor(kColorBodyText, kColorBodyBg);
         d.setTextSize(2);
-        const int startY = 28;   // move up to use the freed space
-        const int lineH  = 22;
-        int screenH = d.height();
-        int visibleRows = (screenH - kFooterH - startY) / lineH;
+        const int startY = 28;
+        const int lineH = 22;
+        int visibleRows = (d.height() - kFooterH - startY) / lineH;
         if (visibleRows < 1) visibleRows = 1;
-
         int itemCount = getItemCount();
-        int sel       = menu.current();
         menu.ensureVisible(itemCount, visibleRows);
         int top = menu.topIndex();
-
+        int selected = menu.current();
         for (int i = top; i < itemCount && i < top + visibleRows; ++i) {
             int y = startY + (i - top) * lineH;
-
-            if (i == sel) {
+            if (i == selected) {
                 d.fillRect(0, y - 2, d.width(), lineH, DARKGREY);
                 d.setTextColor(BLACK, DARKGREY);
             } else {
                 d.setTextColor(WHITE, BLACK);
             }
-
             d.setCursor(8, y);
             if (i == 0) {
-                d.println("Scan for devices");
+                d.println(gMesh.isScanning() ? "Cancel scan" : "Scan for devices");
             } else {
                 int devIndex = i - 1;
                 MeshDeviceInfo info = gMesh.getDeviceInfo(devIndex);
-
                 String label = info.name;
-                if (gMesh.isConnected() && gMesh.connectedDeviceIndex() == devIndex) {
-                    label += " [C]";
-                }
+                if (gMesh.isConnected() && gMesh.connectedDeviceIndex() == devIndex) label += " [C]";
                 d.println(label);
             }
         }
-
-        // --- Bottom help bar ---
-        d.setTextSize(1);
-        drawFooterBackground();
-        d.setTextColor(kColorFooterText, kColorFooterBg);
-        int h = d.height();
-        d.setCursor(4, h - kFooterH + 1);
-        String footer = String("A:Auto ") + (gMesh.autoConnectEnabled() ? "ON" : "OFF");
-        footer += gMesh.isScanning() ? "  Scanning..." : " R:Sync Enter:select";
-        d.print(footer);
     }
-
-private:
-    ListMenuState menu;
 
     int getItemCount() const {
         return 1 + gMesh.getDeviceCount();
@@ -1988,13 +1988,8 @@ private:
         if (sel < 0 || sel >= itemCount) return;
 
         if (sel == 0) {
-            // Scan for devices
-            gMesh.cancelAutoConnectRetries();
-            gMesh.setScanProgressCallback(drawScanCountdown);
-            gMesh.setScanResultsCallback(redrawConnectScreenForScan);
-            gMesh.startScan();
-            gMesh.setScanProgressCallback(nullptr);
-            gMesh.setScanResultsCallback(nullptr);
+            if (gMesh.isScanning()) gMesh.cancelScan();
+            else gMesh.startScan();
             menu.reset();
         } else {
             int devIndex = sel - 1;
@@ -2005,6 +2000,12 @@ private:
         }
     }
 };
+
+void ScreenManager::drawConnectScanUpdates(bool redrawHeader, bool redrawDevices) {
+    if (currentId == ScreenId::CONNECT && connect) {
+        connect->drawScanUpdates(redrawHeader, redrawDevices);
+    }
+}
 
 // -------------------- PIN entry screen --------------------
 
@@ -3438,25 +3439,38 @@ void ScreenManager::redrawIfNeeded() {
     }
 }
 
-void ScreenManager::redrawCurrentScreenNow() {
-    if (!currentScreen) return;
-    currentScreen->draw();
-    needRedraw = false;
-}
-
-void redrawConnectScreenForScan() {
-    gScreens.redrawCurrentScreenNow();
-    if (gScanSecondsLeft >= 0) {
-        drawScanCountdown(gScanSecondsLeft, gScanAttempt, gScanAttempts);
-    }
-}
-
 void ScreenManager::loop() {
     // Update Cardputer (keyboard, etc.)
     M5Cardputer.update();
 
     uint32_t now = millis();
     bool keyChanged = M5Cardputer.Keyboard.isChange();
+    static bool scanWasRunning = false;
+    static int renderedScanAttempt = -1;
+    static int renderedScanSeconds = -2;
+    static uint32_t renderedScanRevision = UINT32_MAX;
+    bool scanning = gMesh.isScanning();
+    if (currentId == ScreenId::CONNECT && scanning && !gScreenSleeping) {
+        int attempt = gMesh.scanAttempt();
+        int seconds = gMesh.scanSecondsLeft();
+        uint32_t revision = gMesh.scanRevision();
+        bool redrawHeader = !scanWasRunning || attempt != renderedScanAttempt ||
+                            seconds != renderedScanSeconds;
+        bool redrawDevices = !scanWasRunning || revision != renderedScanRevision;
+        if (redrawHeader || redrawDevices) {
+            drawConnectScanUpdates(redrawHeader, redrawDevices);
+        }
+        renderedScanAttempt = attempt;
+        renderedScanSeconds = seconds;
+        renderedScanRevision = revision;
+    } else if (scanWasRunning) {
+        // One normal full draw settles the screen after scan completion/cancel.
+        needRedraw = true;
+        renderedScanAttempt = -1;
+        renderedScanSeconds = -2;
+        renderedScanRevision = UINT32_MAX;
+    }
+    scanWasRunning = scanning;
     if (keyChanged) {
         gLastInputMs = now;
         if (gScreenSleeping) {
@@ -3756,6 +3770,25 @@ void setup() {
 
 
 void loop() {
+#if defined(CARDTASTIC_DEBUG_BLE_TIMING) && CARDTASTIC_DEBUG_BLE_TIMING
+    const uint32_t startedUs = micros();
+#endif
     gMesh.loop();      // BLE event handling
+#if defined(CARDTASTIC_DEBUG_BLE_TIMING) && CARDTASTIC_DEBUG_BLE_TIMING
+    const uint32_t bleUs = micros() - startedUs;
+#endif
     gScreens.loop();
+#if defined(CARDTASTIC_DEBUG_BLE_TIMING) && CARDTASTIC_DEBUG_BLE_TIMING
+    static uint32_t maxBleUs = 0;
+    static uint32_t maxLoopUs = 0;
+    static uint32_t lastReportMs = 0;
+    maxBleUs = std::max(maxBleUs, bleUs);
+    maxLoopUs = std::max(maxLoopUs, static_cast<uint32_t>(micros() - startedUs));
+    if (millis() - lastReportMs >= 1000) {
+        Serial.printf("[Timing] max BLE=%lu us, max loop=%lu us\n",
+                      static_cast<unsigned long>(maxBleUs), static_cast<unsigned long>(maxLoopUs));
+        maxBleUs = maxLoopUs = 0;
+        lastReportMs = millis();
+    }
+#endif
 }

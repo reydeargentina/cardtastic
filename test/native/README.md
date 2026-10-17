@@ -42,8 +42,39 @@ validate its policy, not FreeRTOS scheduling or NimBLE's internals.
 - Continuous traffic/notifications must not starve keyboard or lifecycle events.
   Reception yields after eight records or approximately 30 ms between GATT calls;
   individual synchronous GATT operations may take longer.
-- Request a scan while connected: the link closes first; scanning is available
-  on the next selection, without changing active device indexes underneath BLE.
+- Request a scan while connected: the link closes first; scanning starts
+  automatically, without changing active device indexes underneath BLE.
+
+## Nonblocking BLE work (CT-12)
+
+- Leave the saved radio off. Request Scan during the first auto-connect attempt,
+  during retry backoff, and near the timeout boundary. One selection must cancel
+  retries, wait for the terminal event and native GAP inactivity, then scan.
+  There must be no `Unable to scan - connection in progress` error.
+- While waiting for cancellation, cancel Scan or leave Connect with Backspace.
+  No scan may start later. A subsequent manual scan/connection must work.
+- During each scan attempt, navigate the live results, cancel with Enter on
+  `Cancel scan`, or return home with Backspace. Select a discovered device while
+  scanning: discovery stops before the connection starts. Repeat several times.
+- With no nearby radios, the three eight-second attempts must finish without
+  blocking navigation. With unnamed results, names can update between attempts.
+- Sync a large node database while using the keyboard and receiving numbered
+  messages. Compare received IDs/history against the sender: yielding between
+  batches must not discard records. The existing receive budget remains eight
+  records or 30 ms, checked between synchronous GATT reads.
+- For physical latency measurements, build with
+  `-DCARDTASTIC_DEBUG_BLE_TIMING=1`. Serial reports maximum BLE service and full
+  loop duration once per second, in microseconds. Record maxima while idle,
+  scanning, cancelling a connection, and synchronizing the same database, plus
+  observed keyboard response. These are service durations, not a guaranteed
+  keyboard latency; an individual synchronous GATT operation can exceed the
+  receive budget. No hardware latency figures are claimed by the native tests.
+- The previous blocking scan occupied the loop for each eight-second attempt
+  (up to three attempts plus pauses). Compare with the new build on the same
+  hardware; record firmware versions, node counts, timings and serial logs.
+- Full GATT enumeration is diagnostic only and requires
+  `-DCARDTASTIC_DEBUG_GATT=1`; normal connection discovers only the Meshtastic
+  service/characteristics it needs.
 
 ## Radio/session checks (issue #4)
 
