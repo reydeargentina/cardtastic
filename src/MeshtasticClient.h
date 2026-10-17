@@ -92,11 +92,6 @@ public:
     void begin();
     void loop();
 
-    using ScanProgressCallback = void (*)(int secondsLeft, int attempt, int attempts);
-    void setScanProgressCallback(ScanProgressCallback cb) { _scanProgressCb = cb; }
-    using ScanResultsCallback = void (*)();
-    void setScanResultsCallback(ScanResultsCallback cb) { _scanResultsCb = cb; }
-
     // ---- General state ----
     ConnectionStatus status()      const { return _status; }
     const String&    radioName()   const { return _radioName; }
@@ -113,6 +108,10 @@ public:
 
     // ---- Scan and devices ----
     void          startScan();
+    void          cancelScan();
+    int           scanAttempt() const { return _scanAttempt; }
+    int           scanSecondsLeft() const;
+    uint32_t      scanRevision() const { return _scanRevision; }
     bool          discoverMeshtasticService();
     int           getDeviceCount() const;
     MeshDeviceInfo getDeviceInfo(int index) const;
@@ -159,6 +158,15 @@ public:
     bool submitPasskey(uint32_t passkey);
 
 private:
+    void processScan(uint32_t now);
+    bool beginScanAttempt();
+    bool _scanWaitingForClose = false;
+    bool _scanAttemptRunning = false;
+    uint8_t _scanAttempt = 0;
+    uint32_t _scanStartedMs = 0;
+    uint32_t _scanRequestedMs = 0;
+    uint32_t _scanNextAttemptMs = 0;
+    uint32_t _scanRevision = 0;
     // --- Internal helpers ---
     void processBleEvents();
     void handleDisconnect(int reason);
@@ -243,8 +251,6 @@ private:
     std::vector<MeshNodeInfo>   _nodes;
     std::vector<MeshChannelInfo> _channels;
     NimBLEClient*               _client;
-    ScanProgressCallback        _scanProgressCb = nullptr;
-    ScanResultsCallback         _scanResultsCb = nullptr;
 
     NimBLERemoteService*        _svc;
     NimBLERemoteCharacteristic* _charToRadio;    // f75c... (write)

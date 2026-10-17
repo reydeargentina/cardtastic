@@ -191,8 +191,6 @@ MeshtasticClient::MeshtasticClient()
       _pendingDeliveries(),
       _deliveryUpdates(),
       _client(nullptr),
-      _scanProgressCb(nullptr),
-      _scanResultsCb(nullptr),
       _svc(nullptr),
       _charToRadio(nullptr),
       _charFromRadio(nullptr),
@@ -244,8 +242,6 @@ void MeshtasticClient::begin() {
     _nodes.clear();
     _channels.clear();
     _knownDevices.clear();
-    _scanProgressCb = nullptr;
-    _scanResultsCb = nullptr;
     loadConnectionPreferences();
 
     _client         = nullptr;
@@ -261,6 +257,7 @@ void MeshtasticClient::loop() {
     processTransportClose();
     uint32_t now = millis();
     processAutoConnectRetries(now);
+    processScan(now);
     if (_ble.closing || !_ble.active || !_client || !_client->isConnected()) {
         expirePendingDeliveries(now);
         return;
@@ -323,6 +320,7 @@ void MeshtasticClient::loop() {
 }
 
 const char* MeshtasticClient::sessionStatusLabel() const {
+    if (_scanning) return _scanWaitingForClose ? "CANCELING BLE" : "SCANNING";
     if (_ble.closing) return _status == ConnectionStatus::ERROR ? "ERROR" : "CLOSING";
     if (_status == ConnectionStatus::CONNECTED) {
         if (_needsServiceDiscovery) return _awaitingPasskey ? "ENTER PIN" : "AUTH";
@@ -414,7 +412,7 @@ void MeshtasticClient::closeTransport() {
 
 void MeshtasticClient::processTransportClose() {
     if (!_ble.closing) return;
-    if (_ble.canRelease(_client->isConnected())) {
+    if (_ble.canRelease(_client->isConnected(), ble_gap_conn_active())) {
         // The disconnect callback precedes NimBLE clearing its connection handle.
         // Never reconnect/delete attributes while that cleanup is still running.
         _ble.release();
@@ -490,118 +488,106 @@ bool MeshtasticClient::ingestScanObservation(const char* address,
 }
 
 void MeshtasticClient::startScan() {
-    // The UI may request a scan during connect/pairing. Finish closing first;
-    // do not mutate the device-index mapping under an active connection.
-    if (_ble.active || _ble.closing) {
-        disconnect();
-        _lastError = "Disconnecting; scan again";
-        return;
-    }
-    _devices.clear();
-    ScanObservation staleObservation;
-    while (popScanObservation(staleObservation)) {
-    }
+    if (_scanning) return;
+    cancelAutoConnectRetries();
+    _nextConnectIndex = -1;
+    _scanning = true;
+    _scanWaitingForClose = true;
+    _scanAttemptRunning = false;
+    _scanAttempt = 0;
+    _scanRevision = 0;
+    _scanRequestedMs = millis();
     _lastError = "";
-    _scanning  = true;
-    _status    = ConnectionStatus::SCANNING;
+    closeTransport();
+    // GAP can still own a connect procedure after application state changes.
+    if (!_ble.active && ble_gap_conn_active()) ble_gap_conn_cancel();
+}
 
-    Serial.println("[Mesh] Starting BLE scan...");
+void MeshtasticClient::cancelScan() {
+    if (!_scanning) return;
+    if (_scanAttemptRunning) NimBLEDevice::getScan()->stop();
+    _scanning = false;
+    _scanWaitingForClose = false;
+    _scanAttemptRunning = false;
+    _lastError = "";
+    if (!_ble.active && !_ble.closing) _status = ConnectionStatus::DISCONNECTED;
+}
 
-    NimBLEScan* pScan = NimBLEDevice::getScan();
+int MeshtasticClient::scanSecondsLeft() const {
+    if (!_scanAttemptRunning) return -1;
+    int elapsed = (millis() - _scanStartedMs) / 1000;
+    return elapsed < kScanSeconds ? kScanSeconds - elapsed : 0;
+}
 
-    pScan->setActiveScan(true);        // request more info (name, etc.)
-    pScan->setInterval(160);           // 100 ms
-    pScan->setWindow(80);              //  50 ms (<= interval)
-    pScan->setScanCallbacks(&gScanCallbacks, true); // accept duplicates so scan responses can supply the name
-    pScan->clearResults();             // clear previous results
+bool MeshtasticClient::beginScanAttempt() {
+    ++_scanAttempt;
+    Serial.printf("[Mesh] Scan attempt %u/%d\n", _scanAttempt, kScanAttempts);
+    if (!NimBLEDevice::getScan()->start(kScanSeconds * 1000UL, false)) {
+        _scanning = false;
+        _status = ConnectionStatus::ERROR;
+        _lastError = "Scan start failed";
+        return false;
+    }
+    _scanStartedMs = millis();
+    _scanAttemptRunning = true;
+    return true;
+}
 
-    int totalFound = 0;
-    for (int attempt = 0; attempt < kScanAttempts; ++attempt) {
-        Serial.printf("[Mesh] Scan attempt %d/%d\n", attempt + 1, kScanAttempts);
-        uint32_t startMs = millis();
-        uint32_t lastResultsCheckMs = 0;
-        int lastRemaining = kScanSeconds;
-        if (_scanProgressCb) {
-            _scanProgressCb(lastRemaining, attempt + 1, kScanAttempts);
-        }
-
-        bool ok = pScan->start(kScanSeconds * 1000UL, false);
-        if (!ok) {
-            Serial.println("[Mesh] pScan->start() returned false");
-            _scanning  = false;
-            _status    = ConnectionStatus::ERROR;
-            _lastError = "Scan start failed";
+void MeshtasticClient::processScan(uint32_t now) {
+    if (!_scanning) return;
+    if (_scanWaitingForClose) {
+        if (_ble.active || _ble.closing || ble_gap_conn_active() ||
+            (_client && _client->isConnected())) {
+            if (now - _scanRequestedMs >= kTransportCloseTimeoutMs + kBleConnectTimeoutMs) {
+                _scanning = false;
+                _status = ConnectionStatus::ERROR;
+                _lastError = "BLE busy; retry scan";
+            }
             return;
         }
-
-        while (pScan->isScanning()) {
-            delay(50);
-            uint32_t now = millis();
-            if (now - lastResultsCheckMs >= 50) {
-                lastResultsCheckMs = now;
-                ScanObservation observation;
-                bool changed = false;
-                while (popScanObservation(observation)) {
-                    changed = ingestScanObservation(observation.address,
-                                                    observation.name,
-                                                    observation.addrType) || changed;
-                }
-                if (changed && _scanResultsCb) {
-                    _scanResultsCb();
-                }
-            }
-            if (_scanProgressCb) {
-                int elapsed = (int)((now - startMs) / 1000UL);
-                int remaining = kScanSeconds - elapsed;
-                if (remaining < 0) remaining = 0;
-                if (remaining != lastRemaining) {
-                    lastRemaining = remaining;
-                    _scanProgressCb(remaining, attempt + 1, kScanAttempts);
-                }
-            }
-        }
-        if (_scanProgressCb) {
-            _scanProgressCb(0, attempt + 1, kScanAttempts);
-        }
-
-        ScanObservation observation;
-        bool changed = false;
-        while (popScanObservation(observation)) {
-            changed = ingestScanObservation(observation.address,
-                                            observation.name,
-                                            observation.addrType) || changed;
-        }
-        if (changed && _scanResultsCb) {
-            _scanResultsCb();
-        }
-        Serial.printf("[Mesh] Scan done, Meshtastic devices=%u\n", (unsigned)_devices.size());
-
-        pScan->clearResults();
-        totalFound = (int)_devices.size();
-        bool anyUnnamed = false;
-        for (const auto& dev : _devices) {
-            if (dev.name == dev.id) {
-                anyUnnamed = true;
-                break;
-            }
-        }
-        if (totalFound > 0 && !anyUnnamed) break;
-        delay(150);
-    }
-
-    _scanning       = false;
-    _connectedIndex = -1;
-    _radioName      = "";
-
-    if (totalFound == 0) {
-        _status    = ConnectionStatus::ERROR;
-        _lastError = "No devices";
-    } else {
-        _status    = ConnectionStatus::DISCONNECTED;
+        _scanWaitingForClose = false;
+        _devices.clear();
+        ScanObservation stale;
+        while (popScanObservation(stale)) {}
+        _connectedIndex = -1;
+        _radioName = "";
         _lastError = "";
+        _status = ConnectionStatus::SCANNING;
+        NimBLEScan* scan = NimBLEDevice::getScan();
+        scan->setActiveScan(true);
+        scan->setInterval(160);
+        scan->setWindow(80);
+        scan->setScanCallbacks(&gScanCallbacks, true);
+        scan->clearResults();
+        beginScanAttempt();
+        return;
     }
 
-    Serial.printf("[Mesh] Stored %d devices in list\n", _devices.size());
+    ScanObservation observation;
+    // At most one bounded buffer of observations per iteration.
+    for (size_t count = 0; count < kScanObservationCapacity && popScanObservation(observation); ++count) {
+        if (ingestScanObservation(observation.address, observation.name, observation.addrType)) {
+            ++_scanRevision;
+        }
+    }
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    if (_scanAttemptRunning) {
+        if (scan->isScanning()) return;
+        _scanAttemptRunning = false;
+        scan->clearResults();
+        bool unnamed = false;
+        for (const auto& device : _devices) {
+            if (device.name == device.id) unnamed = true;
+        }
+        if (_scanAttempt >= kScanAttempts || (!_devices.empty() && !unnamed)) {
+            _scanning = false;
+            _status = _devices.empty() ? ConnectionStatus::ERROR : ConnectionStatus::DISCONNECTED;
+            _lastError = _devices.empty() ? "No devices" : "";
+            return;
+        }
+        _scanNextAttemptMs = now + 150;
+    }
+    if (meshDeadlineReached(now, _scanNextAttemptMs)) beginScanAttempt();
 }
 
 int MeshtasticClient::getDeviceCount() const {
@@ -1041,6 +1027,7 @@ bool MeshtasticClient::discoverMeshtasticService() {
 // ---- Connect by index ----
 
 bool MeshtasticClient::connectToIndex(int index) {
+    cancelScan();
     if (index < 0 || index >= (int)_devices.size()) {
         _lastError = "Invalid device index";
         _status    = ConnectionStatus::ERROR;
@@ -1119,6 +1106,7 @@ bool MeshtasticClient::startConnection(int index) {
 // ---- Service/characteristic dump ----
 
 void MeshtasticClient::debugDumpServices() {
+#if defined(CARDTASTIC_DEBUG_GATT) && CARDTASTIC_DEBUG_GATT
     if (!_client || !_client->isConnected()) {
         Serial.println("[Mesh] debugDumpServices: not connected");
         return;
@@ -1163,6 +1151,7 @@ void MeshtasticClient::debugDumpServices() {
                           chUuid.c_str(), rd, wr, wnr, nt, ind);
         }
     }
+#endif
 }
 
 // ---- Disconnect ----
@@ -1170,6 +1159,7 @@ void MeshtasticClient::debugDumpServices() {
 void MeshtasticClient::disconnect() {
     Serial.println("[Mesh] Disconnect requested");
 
+    cancelScan();
     cancelAutoConnectRetries();
     _nextConnectIndex = -1;
     closeTransport();

@@ -93,7 +93,9 @@ public:
     }
 
     bool accepts(uint32_t eventSession) const { return active && eventSession == id; }
-    bool canRelease(bool stackConnected) const { return closing && terminalSeen && !stackConnected; }
+    bool canRelease(bool stackConnected, bool stackConnecting = false) const {
+        return closing && terminalSeen && !stackConnected && !stackConnecting;
+    }
     void release() { active = closing = terminalSeen = false; }
 };
 

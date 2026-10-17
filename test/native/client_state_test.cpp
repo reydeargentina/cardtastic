@@ -225,6 +225,7 @@ static void lifecycle() {
     assert(!sync.complete(oldConfig, true, 1));
     session.terminalSeen = true;
     assert(!session.canRelease(true)); // callback arrives before stack handle is cleared
+    assert(!session.canRelease(false, true)); // no handle does not mean GAP is idle
     assert(!session.begin());
     assert(session.canRelease(false));
     session.release();
@@ -242,6 +243,7 @@ static void lifecycle() {
     session.closing = true;
     assert(!session.canRelease(false));
     session.terminalSeen = true;
+    assert(!session.canRelease(false, true)); // scan/reconnect must wait for native cancel
     assert(session.canRelease(false));
     session.release();
     session.id = UINT32_MAX;
