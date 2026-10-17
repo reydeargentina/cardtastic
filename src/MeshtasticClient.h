@@ -22,12 +22,20 @@ struct MeshDeviceInfo {
     uint8_t addrType = BLE_ADDR_PUBLIC; // Use address type from scan (public/random)
 };
 
+enum class MeshActivitySource {
+    UNKNOWN,
+    RADIO_TIME,
+    LOCAL_OBSERVATION
+};
+
 // Minimal info for a known Meshtastic node
 struct MeshNodeInfo {
     uint32_t num = 0;
     String   longName;
     String   shortName;
-    uint32_t lastHeard = 0;
+    uint32_t lastHeard = 0; // Radio epoch seconds; zero means unavailable.
+    uint32_t lastActivityObservedMs = 0; // Monotonic fallback when packet time is missing.
+    MeshActivitySource activitySource = MeshActivitySource::UNKNOWN;
     float    snr = 0.0f;
     uint8_t  channel = 0;
     bool     via_mqtt = false;
@@ -38,7 +46,6 @@ struct MeshNodeInfo {
     uint32_t batteryLevel = 0;
     bool     hasVoltage = false;
     float    voltage = 0.0f;
-    uint32_t lastUpdateMs = 0;
 };
 
 // Text message received from Meshtastic (queued for the UI)
@@ -117,7 +124,8 @@ public:
     // ---- Known nodes ----
     int           getNodeCount() const;
     MeshNodeInfo  getNodeInfo(int index) const;
-    void          noteNode(uint32_t num);
+    // Ensures a node appears in the roster without marking it active.
+    void          ensureNode(uint32_t num);
 
     // ---- Known channels ----
     int            getChannelCount() const;
@@ -136,6 +144,8 @@ public:
     uint32_t myNodeNum() const { return _myNodeNum; }
     String   nodeLabel(uint32_t nodeNum) const;
     const String& timeZone() const { return _timeZone; }
+    // Estimates current radio epoch from the most recent valid radio timestamp.
+    bool radioTimeNow(uint32_t& epoch) const;
 
     // ---- Outgoing messages ----
     bool requestConfig();
@@ -182,6 +192,7 @@ private:
     bool attemptAutoConnect();
     void scheduleAutoConnectRetry(const char* reason);
     void processAutoConnectRetries(uint32_t now);
+    void updateRadioTimeReference(uint32_t epoch);
 
     ConnectionStatus            _status;
     String                      _radioName;
@@ -206,6 +217,9 @@ private:
     uint32_t                    _nextAutoConnectAttemptMs;
     uint32_t                    _myNodeNum;
     String                      _timeZone;
+    uint32_t                    _radioTimeEpoch;
+    uint32_t                    _radioTimeAnchorMs;
+    bool                        _hasRadioTimeReference;
     bool                        _needsPull;
     MeshConfigSync              _sync;
     MeshBleSession              _ble;

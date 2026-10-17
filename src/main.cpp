@@ -1320,9 +1320,34 @@ const char* channelRoleLabel(uint8_t role) {
     return "?";
 }
 
-String formatAge(uint32_t lastUpdateMs) {
-    if (lastUpdateMs == 0) return "-";
-    uint32_t ageSec = (millis() - lastUpdateMs) / 1000;
+bool nodeActivityAgeSecondsAt(const MeshNodeInfo& node,
+                              uint32_t& ageSec,
+                              uint32_t nowMs,
+                              bool hasRadioTime,
+                              uint32_t radioNowEpoch) {
+    if (node.activitySource == MeshActivitySource::RADIO_TIME) {
+        if (node.lastHeard == 0 || !hasRadioTime || node.lastHeard > radioNowEpoch) {
+            return false;
+        }
+        ageSec = radioNowEpoch - node.lastHeard;
+        return true;
+    }
+    if (node.activitySource == MeshActivitySource::LOCAL_OBSERVATION) {
+        ageSec = (nowMs - node.lastActivityObservedMs) / 1000;
+        return true;
+    }
+    return false;
+}
+
+bool nodeActivityAgeSeconds(const MeshNodeInfo& node, uint32_t& ageSec) {
+    uint32_t radioNowEpoch = 0;
+    bool hasRadioTime = gMesh.radioTimeNow(radioNowEpoch);
+    return nodeActivityAgeSecondsAt(node, ageSec, millis(), hasRadioTime, radioNowEpoch);
+}
+
+String formatAge(const MeshNodeInfo& node) {
+    uint32_t ageSec = 0;
+    if (!nodeActivityAgeSeconds(node, ageSec)) return "?";
     if (ageSec < 60) {
         return String(ageSec) + "s";
     }
@@ -1334,14 +1359,10 @@ String formatAge(uint32_t lastUpdateMs) {
     return String(ageHr) + "h";
 }
 
-bool isNodeActive(const MeshNodeInfo& node) {
-    if (node.lastUpdateMs == 0) return false;
-    return (millis() - node.lastUpdateMs) <= kNodeActiveMs;
-}
-
 const char* nodeActivityLabel(const MeshNodeInfo& node) {
-    if (node.lastUpdateMs == 0) return "[UNKNOWN]";
-    return isNodeActive(node) ? "[ACTIVE]" : "[STALE]";
+    uint32_t ageSec = 0;
+    if (!nodeActivityAgeSeconds(node, ageSec)) return "[UNKNOWN]";
+    return ageSec <= kNodeActiveMs / 1000 ? "[ACTIVE]" : "[STALE]";
 }
 
 String nodeNameForRow(const String& name, const String& suffix, M5GFX& display, int maxWidth) {
@@ -2137,7 +2158,7 @@ public:
             d.setCursor(4, 24);
             d.print(nodeActivityLabel(selNode));
             d.print(" Age:");
-            d.println(formatAge(selNode.lastUpdateMs));
+            d.println(formatAge(selNode));
 
             d.setCursor(4, 34);
             d.print("SNR:");
@@ -2243,11 +2264,42 @@ private:
             nodeIndexMap.push_back(i);
         }
 
-        std::sort(nodeIndexMap.begin(), nodeIndexMap.end(), [](int a, int b) {
+        uint32_t sortNowMs = millis();
+        uint32_t sortRadioNowEpoch = 0;
+        bool hasSortRadioTime = gMesh.radioTimeNow(sortRadioNowEpoch);
+        std::sort(nodeIndexMap.begin(), nodeIndexMap.end(),
+                  [sortNowMs, hasSortRadioTime, sortRadioNowEpoch](int a, int b) {
             MeshNodeInfo nodeA = gMesh.getNodeInfo(a);
             MeshNodeInfo nodeB = gMesh.getNodeInfo(b);
-            if (nodeA.lastUpdateMs != nodeB.lastUpdateMs) {
-                return nodeA.lastUpdateMs > nodeB.lastUpdateMs;
+            uint32_t ageA = 0;
+            uint32_t ageB = 0;
+            bool knownA = nodeActivityAgeSecondsAt(nodeA, ageA, sortNowMs,
+                                                   hasSortRadioTime, sortRadioNowEpoch);
+            bool knownB = nodeActivityAgeSecondsAt(nodeB, ageB, sortNowMs,
+                                                   hasSortRadioTime, sortRadioNowEpoch);
+            if (knownA != knownB) return knownA;
+            if (knownA && ageA != ageB) return ageA < ageB;
+
+            auto activityRank = [](const MeshNodeInfo& node) {
+                if (node.activitySource == MeshActivitySource::LOCAL_OBSERVATION) return 2;
+                if (node.activitySource == MeshActivitySource::RADIO_TIME && node.lastHeard != 0) return 1;
+                return 0;
+            };
+            int rankA = activityRank(nodeA);
+            int rankB = activityRank(nodeB);
+            if (rankA != rankB) {
+                // Without a radio clock reference, observed local traffic is
+                // still comparable and sorts ahead of absolute unknown-age data.
+                return rankA > rankB;
+            }
+            if (nodeA.activitySource == MeshActivitySource::RADIO_TIME &&
+                nodeA.lastHeard != nodeB.lastHeard) {
+                return nodeA.lastHeard > nodeB.lastHeard;
+            }
+            if (nodeA.activitySource == MeshActivitySource::LOCAL_OBSERVATION) {
+                uint32_t elapsedA = sortNowMs - nodeA.lastActivityObservedMs;
+                uint32_t elapsedB = sortNowMs - nodeB.lastActivityObservedMs;
+                if (elapsedA != elapsedB) return elapsedA < elapsedB;
             }
             return nodeA.num < nodeB.num;
         });
@@ -2432,7 +2484,7 @@ public:
             d.println(nodeHex(node.num));
             d.setCursor(4, 24);
             d.print("Seen: ");
-            d.println(formatAge(node.lastUpdateMs));
+            d.println(formatAge(node));
         } else {
             d.setCursor(4, 14);
             d.println("No node selected");
@@ -2533,12 +2585,13 @@ public:
 
             d.setCursor(4, 34);
             d.print("Seen: ");
-            d.print(formatAge(node.lastUpdateMs));
+            d.print(formatAge(node));
             d.print("  Active: ");
-            if (node.lastUpdateMs == 0) {
+            uint32_t activityAge = 0;
+            if (!nodeActivityAgeSeconds(node, activityAge)) {
                 d.println("?");
             } else {
-                d.println(isNodeActive(node) ? "yes" : "no");
+                d.println(activityAge <= kNodeActiveMs / 1000 ? "yes" : "no");
             }
 
             d.setCursor(4, 44);
@@ -2845,7 +2898,7 @@ public:
                                               packetId,
                                               conv->channel);
                     if (!conv->isBroadcast && dest != 0) {
-                        gMesh.noteNode(dest);
+                        gMesh.ensureNode(dest);
                     }
                     inputBuffer = "";
                     sendFeedback = "";
