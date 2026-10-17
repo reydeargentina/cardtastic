@@ -181,6 +181,9 @@ MeshtasticClient::MeshtasticClient()
       _nextAutoConnectAttemptMs(0),
       _myNodeNum(0),
       _timeZone(""),
+      _radioTimeEpoch(0),
+      _radioTimeAnchorMs(0),
+      _hasRadioTimeReference(false),
       _needsPull(false),
       _nextPacketId(1),
       _lastPollMs(0),
@@ -225,6 +228,9 @@ void MeshtasticClient::begin() {
     _nextAutoConnectAttemptMs = 0;
     _myNodeNum      = 0;
     _timeZone       = "";
+    _radioTimeEpoch = 0;
+    _radioTimeAnchorMs = 0;
+    _hasRadioTimeReference = false;
     _needsPull      = false;
     _sync.reset();
     _nextPacketId   = esp_random();
@@ -620,10 +626,8 @@ MeshNodeInfo MeshtasticClient::getNodeInfo(int index) const {
     return _nodes[index];
 }
 
-void MeshtasticClient::noteNode(uint32_t num) {
-    MeshNodeInfo* node = getOrCreateNode(num);
-    if (!node) return;
-    node->lastUpdateMs = millis();
+void MeshtasticClient::ensureNode(uint32_t num) {
+    getOrCreateNode(num);
 }
 
 MeshNodeInfo* MeshtasticClient::getOrCreateNode(uint32_t num) {
@@ -633,9 +637,23 @@ MeshNodeInfo* MeshtasticClient::getOrCreateNode(uint32_t num) {
     }
     MeshNodeInfo entry;
     entry.num = num;
-    entry.lastUpdateMs = millis();
     _nodes.push_back(entry);
     return &_nodes.back();
+}
+
+bool MeshtasticClient::radioTimeNow(uint32_t& epoch) const {
+    if (!_hasRadioTimeReference) return false;
+    epoch = _radioTimeEpoch + (millis() - _radioTimeAnchorMs) / 1000;
+    return true;
+}
+
+void MeshtasticClient::updateRadioTimeReference(uint32_t epoch) {
+    if (epoch == 0) return;
+    uint32_t currentEpoch = 0;
+    if (_hasRadioTimeReference && radioTimeNow(currentEpoch) && epoch < currentEpoch) return;
+    _radioTimeEpoch = epoch;
+    _radioTimeAnchorMs = millis();
+    _hasRadioTimeReference = true;
 }
 
 int MeshtasticClient::getChannelCount() const {
@@ -905,6 +923,9 @@ void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _radioName      = "";
     _myNodeNum      = 0;
     _timeZone       = "";
+    _radioTimeEpoch = 0;
+    _radioTimeAnchorMs = 0;
+    _hasRadioTimeReference = false;
     _needsPull      = false;
     _sync.reset();
     _lastPollMs     = 0;
@@ -1577,7 +1598,7 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
 
     if (fr.which_payload_variant == meshtastic_FromRadio_my_info_tag) {
         _myNodeNum = fr.my_info.my_node_num;
-        noteNode(_myNodeNum);
+        ensureNode(_myNodeNum);
         Serial.printf("[Mesh] My node num = %lu\n", (unsigned long)_myNodeNum);
         return true;
     }
@@ -1614,6 +1635,11 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
     }
 
     if (fr.which_payload_variant == meshtastic_FromRadio_node_info_tag) {
+        if (fr.node_info.num == _myNodeNum && fr.node_info.last_heard != 0) {
+            // PhoneAPI refreshes our own NodeInfo.last_heard from the radio's
+            // clock, giving us a current reference for the imported timestamps.
+            updateRadioTimeReference(fr.node_info.last_heard);
+        }
         MeshNodeInfo* node = getOrCreateNode(fr.node_info.num);
         if (!node) return true;
 
@@ -1622,7 +1648,12 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
             node->longName  = String(fr.node_info.user.long_name);
         }
 
-        node->lastHeard = fr.node_info.last_heard;
+        if (fr.node_info.last_heard != 0 &&
+            node->activitySource != MeshActivitySource::LOCAL_OBSERVATION &&
+            (node->lastHeard == 0 || fr.node_info.last_heard >= node->lastHeard)) {
+            node->lastHeard = fr.node_info.last_heard;
+            node->activitySource = MeshActivitySource::RADIO_TIME;
+        }
         node->snr = fr.node_info.snr;
         node->channel = fr.node_info.channel;
         node->via_mqtt = fr.node_info.via_mqtt;
@@ -1637,7 +1668,6 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
             node->voltage = fr.node_info.device_metrics.voltage;
         }
 
-        node->lastUpdateMs = millis();
         return true;
     }
 
@@ -1667,6 +1697,22 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
     }
 
     const meshtastic_MeshPacket& pkt = fr.packet;
+    updateRadioTimeReference(pkt.rx_time);
+    if (pkt.from != 0) {
+        MeshNodeInfo* node = getOrCreateNode(pkt.from);
+        if (node) {
+            node->snr = pkt.rx_snr;
+            node->channel = static_cast<uint8_t>(pkt.channel);
+            if (pkt.rx_time != 0) {
+                node->lastHeard = pkt.rx_time;
+                node->activitySource = MeshActivitySource::RADIO_TIME;
+                node->lastActivityObservedMs = 0;
+            } else {
+                node->lastActivityObservedMs = millis();
+                node->activitySource = MeshActivitySource::LOCAL_OBSERVATION;
+            }
+        }
+    }
     if (pkt.which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
         Serial.printf("[Mesh] Packet not decoded: id=%lu from=0x%08lX to=0x%08lX ch=%u payload_variant=%u\n",
                       (unsigned long)pkt.id,
@@ -1675,15 +1721,6 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
                       (unsigned)pkt.channel,
                       (unsigned)pkt.which_payload_variant);
         return true;
-    }
-
-    if (pkt.from != 0) {
-        MeshNodeInfo* node = getOrCreateNode(pkt.from);
-        if (node) {
-            node->snr = pkt.rx_snr;
-            node->channel = static_cast<uint8_t>(pkt.channel);
-            node->lastUpdateMs = millis();
-        }
     }
 
     const meshtastic_Data& decoded = pkt.decoded;
