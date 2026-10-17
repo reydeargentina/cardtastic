@@ -180,6 +180,7 @@ MeshtasticClient::MeshtasticClient()
       _autoConnectAttemptStartedMs(0),
       _nextAutoConnectAttemptMs(0),
       _myNodeNum(0),
+      _timeZone(""),
       _needsPull(false),
       _nextPacketId(1),
       _lastPollMs(0),
@@ -223,6 +224,7 @@ void MeshtasticClient::begin() {
     _autoConnectAttemptStartedMs = 0;
     _nextAutoConnectAttemptMs = 0;
     _myNodeNum      = 0;
+    _timeZone       = "";
     _needsPull      = false;
     _sync.reset();
     _nextPacketId   = esp_random();
@@ -902,6 +904,7 @@ void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _connectedIndex = -1;
     _radioName      = "";
     _myNodeNum      = 0;
+    _timeZone       = "";
     _needsPull      = false;
     _sync.reset();
     _lastPollMs     = 0;
@@ -1414,7 +1417,8 @@ bool MeshtasticClient::requestConfig() {
 bool MeshtasticClient::sendTextMessage(const String& text,
                                        uint32_t dest,
                                        uint8_t channel,
-                                       uint32_t deliveryToken) {
+                                       uint32_t deliveryToken,
+                                       uint32_t* packetId) {
     if (text.length() == 0) {
         _lastError = "Empty message";
         return false;
@@ -1479,6 +1483,7 @@ bool MeshtasticClient::sendTextMessage(const String& text,
     }
 
     bool ok = writeToRadio(buf, stream.bytes_written, "Send");
+    if (ok && packetId) *packetId = pkt.id;
     if (ok && deliveryToken != 0) {
         PendingDelivery pending;
         pending.token = deliveryToken;
@@ -1574,6 +1579,14 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
         _myNodeNum = fr.my_info.my_node_num;
         noteNode(_myNodeNum);
         Serial.printf("[Mesh] My node num = %lu\n", (unsigned long)_myNodeNum);
+        return true;
+    }
+
+    if (fr.which_payload_variant == meshtastic_FromRadio_config_tag &&
+        fr.config.which_payload_variant == meshtastic_Config_device_tag) {
+        _timeZone = String(fr.config.payload_variant.device.tzdef);
+        Serial.printf("[Mesh] Device timezone: %s\n",
+                      _timeZone.length() ? _timeZone.c_str() : "(unset)");
         return true;
     }
 
@@ -1742,6 +1755,8 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
     MeshTextMessage msg;
     msg.from   = pkt.from;
     msg.to     = pkt.to;
+    msg.packetId = pkt.id;
+    msg.rxTime = pkt.rx_time;
     msg.channel = pkt.channel;
     msg.fromMe = (_myNodeNum != 0 && pkt.from == _myNodeNum);
     msg.text   = text;

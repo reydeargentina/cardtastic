@@ -45,6 +45,8 @@ struct MeshNodeInfo {
 struct MeshTextMessage {
     uint32_t from;
     uint32_t to;
+    uint32_t packetId;
+    uint32_t rxTime;
     uint8_t  channel;
     bool     fromMe;
     String   text;
@@ -133,13 +135,15 @@ public:
     bool     popDeliveryUpdate(MeshDeliveryUpdate& out);
     uint32_t myNodeNum() const { return _myNodeNum; }
     String   nodeLabel(uint32_t nodeNum) const;
+    const String& timeZone() const { return _timeZone; }
 
     // ---- Outgoing messages ----
     bool requestConfig();
     bool sendTextMessage(const String& text,
                          uint32_t dest = 0xFFFFFFFF,
                          uint8_t channel = 0,
-                         uint32_t deliveryToken = 0);
+                         uint32_t deliveryToken = 0,
+                         uint32_t* packetId = nullptr);
     void setPasskey(uint32_t passkey);
     void clearPasskey();
     bool submitPasskey(uint32_t passkey);
@@ -201,6 +205,7 @@ private:
     uint32_t                    _autoConnectAttemptStartedMs;
     uint32_t                    _nextAutoConnectAttemptMs;
     uint32_t                    _myNodeNum;
+    String                      _timeZone;
     bool                        _needsPull;
     MeshConfigSync              _sync;
     MeshBleSession              _ble;
