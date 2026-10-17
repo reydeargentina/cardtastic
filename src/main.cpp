@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdlib.h>
+#include <time.h>
 #include "M5Cardputer.h"
 #include <vector>
 #include <NimBLEDevice.h> 
@@ -32,6 +33,7 @@ enum class NavKey {
 constexpr uint32_t kBroadcastAddr = 0xFFFFFFFF;
 constexpr size_t kConversationMaxMessages = 50;
 constexpr size_t kConversationJsonMax = 32768;
+constexpr uint32_t kPacketDedupWindowSeconds = 10 * 60;
 const char* kStorageDir = "/cardtastic";
 constexpr uint32_t kScreenIdleMs = 60000;
 
@@ -379,6 +381,9 @@ enum class MessageDeliveryState {
 struct Message {
     bool   fromMe;  // true = this UI, false = remote node
     uint32_t from;
+    uint32_t packetId;
+    uint32_t rxTime;
+    uint8_t channel;
     String text;
     MessageDeliveryState delivery = MessageDeliveryState::UNKNOWN;
     uint32_t deliveryToken = 0;
@@ -972,7 +977,7 @@ bool persistConversation(int convIndex) {
     if (!ensureRadioStorage(radio)) return false;
 
     DynamicJsonDocument doc(kConversationJsonMax);
-    doc["version"] = 1;
+    doc["version"] = 2;
     doc["radio"] = radio;
     doc["peer"] = conv->peer;
     doc["broadcast"] = conv->isBroadcast;
@@ -988,6 +993,9 @@ bool persistConversation(int convIndex) {
         JsonObject obj = arr.createNestedObject();
         obj["from"] = msg.from;
         obj["fromMe"] = msg.fromMe;
+        obj["packetId"] = msg.packetId;
+        obj["channel"] = msg.channel;
+        obj["rxTime"] = msg.rxTime;
         obj["text"] = msg.text;
         obj["delivery"] = static_cast<uint8_t>(msg.delivery);
     }
@@ -1089,6 +1097,9 @@ bool loadConversationsFromStorage() {
             Message m;
             m.from = obj["from"] | uint32_t{0};
             m.fromMe = obj["fromMe"] | false;
+            m.packetId = obj["packetId"] | uint32_t{0};
+            m.channel = obj["channel"] | channel;
+            m.rxTime = obj["rxTime"] | uint32_t{0};
             const char* txt = obj["text"] | "";
             m.text = String(txt);
             uint8_t delivery = obj["delivery"] | static_cast<uint8_t>(MessageDeliveryState::UNKNOWN);
@@ -1105,6 +1116,20 @@ bool loadConversationsFromStorage() {
         conv->messages.swap(fromStorage);
         mergeStorageHistories(conv->messages, inMemory, kConversationMaxMessages,
             [](const Message& a, const Message& b) {
+                if (a.packetId != 0 || b.packetId != 0) {
+                    if (a.packetId == 0 || b.packetId == 0 ||
+                        a.packetId != b.packetId || a.from != b.from ||
+                        a.channel != b.channel) {
+                        return false;
+                    }
+                    if (a.rxTime != 0 && b.rxTime != 0) {
+                        uint32_t delta = a.rxTime > b.rxTime
+                                             ? a.rxTime - b.rxTime
+                                             : b.rxTime - a.rxTime;
+                        return delta <= kPacketDedupWindowSeconds;
+                    }
+                    return true;
+                }
                 return a.from == b.from && a.fromMe == b.fromMe && a.text == b.text;
             });
         conv->storageDirty = !inMemory.empty() || migratedPendingDelivery;
@@ -1452,7 +1477,10 @@ void appendConversationMessage(int convIndex,
                                uint32_t from,
                                bool markUnread,
                                MessageDeliveryState delivery = MessageDeliveryState::UNKNOWN,
-                               uint32_t deliveryToken = 0) {
+                               uint32_t deliveryToken = 0,
+                               uint32_t packetId = 0,
+                               uint8_t channel = 0,
+                               uint32_t rxTime = 0) {
     if (gMesh.myNodeNum() == 0 || gMesh.myNodeNum() != gConversationRadioNode) return;
     Conversation* conv = getConversation(convIndex);
     if (!conv) return;
@@ -1460,6 +1488,9 @@ void appendConversationMessage(int convIndex,
     Message msg;
     msg.fromMe = fromMe;
     msg.from = from;
+    msg.packetId = packetId;
+    msg.rxTime = rxTime;
+    msg.channel = channel;
     msg.text = text;
     msg.delivery = delivery;
     msg.deliveryToken = deliveryToken;
@@ -1476,6 +1507,37 @@ void appendConversationMessage(int convIndex,
     }
     conv->lastActivitySeq = gNextActivitySeq++;
     persistConversation(convIndex);
+}
+
+bool reconcileOrDeduplicatePacket(const MeshTextMessage& incoming) {
+    if (incoming.packetId == 0 || incoming.from == 0) return false;
+
+    for (size_t convIndex = 0; convIndex < gConversations.size(); ++convIndex) {
+        auto& conv = gConversations[convIndex];
+        for (auto& message : conv.messages) {
+            if (message.packetId != incoming.packetId ||
+                message.from != incoming.from ||
+                message.channel != incoming.channel) {
+                continue;
+            }
+
+            if (message.rxTime != 0 && incoming.rxTime != 0) {
+                uint32_t delta = message.rxTime > incoming.rxTime
+                                     ? message.rxTime - incoming.rxTime
+                                     : incoming.rxTime - message.rxTime;
+                if (delta > kPacketDedupWindowSeconds) continue;
+            }
+
+            // A local radio echo enriches the sent row instead of creating a
+            // second copy. The same path upgrades a duplicate's unknown time.
+            if (message.rxTime == 0 && incoming.rxTime != 0) {
+                message.rxTime = incoming.rxTime;
+                persistConversation(static_cast<int>(convIndex));
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 void applyDeliveryUpdate(const MeshDeliveryUpdate& update) {
@@ -2688,6 +2750,7 @@ class ChatScreen : public Screen {
         String text;
         size_t coloredPrefixLength = 0;
         uint16_t prefixColor = WHITE;
+        bool isDateSeparator = false;
     };
 
 public:
@@ -2764,11 +2827,13 @@ public:
                 uint32_t dest = conv->isBroadcast ? kBroadcastAddr : conv->peer;
                 uint32_t deliveryToken = gNextDeliveryToken++;
                 if (deliveryToken == 0) deliveryToken = gNextDeliveryToken++;
+                uint32_t packetId = 0;
                 String outgoingText = inputBuffer;
                 bool sent = gMesh.sendTextMessage(outgoingText,
                                                   dest,
                                                   conv->channel,
-                                                  deliveryToken);
+                                                  deliveryToken,
+                                                  &packetId);
                 if (sent) {
                     appendConversationMessage(gActiveConversation,
                                               true,
@@ -2776,7 +2841,9 @@ public:
                                               gMesh.myNodeNum(),
                                               false,
                                               MessageDeliveryState::PENDING,
-                                              deliveryToken);
+                                              deliveryToken,
+                                              packetId,
+                                              conv->channel);
                     if (!conv->isBroadcast && dest != 0) {
                         gMesh.noteNode(dest);
                     }
@@ -2874,7 +2941,13 @@ public:
         for (int i = start; i < end; ++i) {
             d.setCursor(2, y);
             const ChatLine& line = lines[i];
-            if (line.coloredPrefixLength > 0 && line.coloredPrefixLength <= line.text.length()) {
+            if (line.isDateSeparator) {
+                d.setTextColor(CYAN, kColorBodyBg);
+                int x = (w - d.textWidth(line.text)) / 2;
+                d.setCursor(x > 2 ? x : 2, y);
+                drawDisplayText(d, line.text, CYAN);
+                d.println();
+            } else if (line.coloredPrefixLength > 0 && line.coloredPrefixLength <= line.text.length()) {
                 d.setTextColor(line.prefixColor, kColorBodyBg);
                 drawDisplayText(d, line.text.substring(0, line.coloredPrefixLength), line.prefixColor);
                 d.setTextColor(kColorBodyText, kColorBodyBg);
@@ -2928,6 +3001,31 @@ public:
     }
 
 private:
+    bool formatMessageTime(uint32_t epoch, String& timeText, String& dateText) const {
+        const String& tz = gMesh.timeZone();
+        if (epoch == 0 || tz.length() == 0) return false;
+
+        static String activeTimezone;
+        if (activeTimezone != tz) {
+            if (setenv("TZ", tz.c_str(), 1) != 0) return false;
+            tzset();
+            activeTimezone = tz;
+        }
+
+        time_t rawTime = static_cast<time_t>(epoch);
+        struct tm localTime;
+        if (!localtime_r(&rawTime, &localTime)) return false;
+        char timeBuffer[6];
+        char dateBuffer[11];
+        if (strftime(timeBuffer, sizeof(timeBuffer), "%H:%M", &localTime) == 0 ||
+            strftime(dateBuffer, sizeof(dateBuffer), "%d/%m/%Y", &localTime) == 0) {
+            return false;
+        }
+        timeText = timeBuffer;
+        dateText = dateBuffer;
+        return true;
+    }
+
     String truncateToWidth(const String& text, int maxWidth, M5GFX& d) const {
         if (maxWidth <= 0) return String("");
         if (d.textWidth(text) <= maxWidth) return text;
@@ -2949,14 +3047,6 @@ private:
             }
         }
         return ellipsis;
-    }
-
-    String makeIndent(int targetWidth, M5GFX& d) const {
-        String indent;
-        while (d.textWidth(indent) < targetWidth && indent.length() < 40) {
-            indent += " ";
-        }
-        return indent;
     }
 
     void appendWrappedText(const String& prefix,
@@ -2981,7 +3071,7 @@ private:
             out.push_back(line);
         };
         int prefixWidth = d.textWidth(effectivePrefix);
-        String indent = makeIndent(prefixWidth, d);
+        const String indent = "  ";
 
         String clean = text;
         clean.replace('\n', ' ');
@@ -3076,10 +3166,21 @@ private:
         out.clear();
         d.setTextSize(1);
         int maxWidth = d.width() - 4;
+        String previousDate;
         for (const auto& msg : conv.messages) {
+            String timeText = "--:--";
+            String dateText;
+            if (formatMessageTime(msg.rxTime, timeText, dateText) &&
+                dateText != previousDate) {
+                ChatLine dateLine;
+                dateLine.text = String("--- ") + dateText + " ---";
+                dateLine.isDateSeparator = true;
+                out.push_back(dateLine);
+                previousDate = dateText;
+            }
             String label = msg.fromMe ? String("Me") : resolvedNodeLabel(msg.from);
             label = mapSpanishGlyphsForDisplay(label, true);
-            String prefix = label + "> ";
+            String prefix = timeText + " " + label + "> ";
             size_t coloredPrefixLength = msg.fromMe ? prefix.length() : 0;
             uint16_t prefixColor = kColorBodyText;
             if (msg.fromMe) {
@@ -3362,6 +3463,10 @@ void ScreenManager::loop() {
     MeshTextMessage msg;
     while (gMesh.popTextMessage(msg)) {
         if (gMesh.myNodeNum() == 0 || gMesh.myNodeNum() != gConversationRadioNode) continue;
+        if (reconcileOrDeduplicatePacket(msg)) {
+            gotMessage = true;
+            continue;
+        }
         bool isBroadcast = (msg.to == kBroadcastAddr || msg.to == 0);
         uint32_t sender = msg.from;
         if (!msg.fromMe && !isBroadcast && sender == 0) {
@@ -3382,7 +3487,16 @@ void ScreenManager::loop() {
                       convIndex,
                       isActive ? 1 : 0,
                       markUnread ? 1 : 0);
-        appendConversationMessage(convIndex, msg.fromMe, msg.text, sender, markUnread);
+        appendConversationMessage(convIndex,
+                                 msg.fromMe,
+                                 msg.text,
+                                 sender,
+                                 markUnread,
+                                 MessageDeliveryState::UNKNOWN,
+                                 0,
+                                 msg.packetId,
+                                 msg.channel,
+                                 msg.rxTime);
         gotMessage = true;
     }
     if (gotMessage) {
