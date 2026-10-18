@@ -1,6 +1,7 @@
 #include "ClientState.h"
 #include "MessageTextPolicy.h"
 #include "StoragePolicy.h"
+#include "UiPolicy.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -40,6 +41,12 @@ static void storagePolicy() {
     mergeStorageHistories(disjoint, ram, 3,
         [](const std::string& a, const std::string& b) { return a == b; });
     assert((disjoint == std::vector<std::string>{"disk-2", "ram-1", "ram-2"}));
+}
+
+static void unreadVisibilityPolicy() {
+    assert(!shouldMarkMessageUnread(true, false));  // local echo is not unread
+    assert(!shouldMarkMessageUnread(false, true));  // awake chat at bottom
+    assert(shouldMarkMessageUnread(false, false));  // asleep, elsewhere or scrolled up
 }
 
 static void messageTextPolicy() {
@@ -274,6 +281,7 @@ static void radioIdentityIsolation() {
 
 int main() {
     storagePolicy();
+    unreadVisibilityPolicy();
     messageTextPolicy();
     synchronization();
     eventQueue();

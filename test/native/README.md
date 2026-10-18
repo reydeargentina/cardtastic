@@ -92,6 +92,26 @@ validate its policy, not FreeRTOS scheduling or NimBLE's internals.
   delivery ends as failed in the original radio's runtime history, never updates
   a message on the other radio.
 
+## Live UI and unread checks (CT-11)
+
+- Keep the Nodes screen open while a node packet and fresh NodeInfo/device
+  metrics arrive. Verify SNR, battery, activity label and age refresh without
+  keyboard input. With no new packet, age refreshes at the bounded UI interval.
+- Change BLE connection state while Nodes, Channels, Conversations and Chat are
+  open; the visible status should update without navigating away and back.
+- Open a conversation, scroll away from the bottom, and receive a message:
+  it remains unread. Return to the bottom and interact with the visible chat to
+  clear its unread state.
+- Put the display to sleep while Chat is open, receive a message, then wake it.
+  The message remains unread until the user sees/interacts with the chat; wake
+  alone must not silently clear unread state.
+- Keep Conversations open while incoming traffic changes unread/order. The same
+  peer/channel stays selected after sorting; an added or removed selection is
+  reset predictably rather than pointing at a different conversation.
+- Observe idle Nodes/Home screens for a minute: refreshes should be bounded to
+  metric changes, the age interval, or battery label changes, with no continuous
+  full-screen repaint.
+
 ## Conversation storage checks (issue #5)
 
 - With two radios and the same broadcast channel and DM peer, save messages on

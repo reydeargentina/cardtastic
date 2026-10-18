@@ -123,6 +123,7 @@ public:
     // ---- Known nodes ----
     int           getNodeCount() const;
     MeshNodeInfo  getNodeInfo(int index) const;
+    uint32_t      nodeRevision() const { return _nodeRevision; }
     // Ensures a node appears in the roster without marking it active.
     void          ensureNode(uint32_t num);
 
@@ -224,6 +225,7 @@ private:
     uint32_t                    _autoConnectAttemptStartedMs;
     uint32_t                    _nextAutoConnectAttemptMs;
     uint32_t                    _myNodeNum;
+    uint32_t                    _nodeRevision = 0;
     String                      _timeZone;
     uint32_t                    _radioTimeEpoch;
     uint32_t                    _radioTimeAnchorMs;

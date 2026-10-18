@@ -12,6 +12,7 @@
 #include "MeshtasticClient.h"
 #include "MessageTextPolicy.h"
 #include "StoragePolicy.h"
+#include "UiPolicy.h"
 #include "meshtastic/channel.pb.h"
 
 // -------------------- Basic navigation --------------------
@@ -36,6 +37,8 @@ constexpr size_t kConversationJsonMax = 32768;
 constexpr uint32_t kPacketDedupWindowSeconds = 10 * 60;
 const char* kStorageDir = "/cardtastic";
 constexpr uint32_t kScreenIdleMs = 60000;
+constexpr uint32_t kLiveNodeRefreshMs = 5000;
+constexpr uint32_t kNodeUpdateCoalesceMs = 1000;
 
 constexpr uint16_t kColorBodyBg = BLACK;
 constexpr uint16_t kColorBodyText = WHITE;
@@ -414,6 +417,10 @@ static bool gLastRenderedConfigComplete = false;
 static String gLastRenderedSessionStatus;
 static String gLastRenderedError;
 static String gLastRenderedStorageError;
+static String gLastRenderedBatteryStatus;
+static uint32_t gLastRenderedNodeRevision = UINT32_MAX;
+static uint32_t gLastNodeScreenRefreshMs = 0;
+static uint32_t gLastBatteryCheckMs = 0;
 
 constexpr uint32_t kNodeActiveMs = 5UL * 60UL * 1000UL;
 static bool gSdReady = false;
@@ -2766,6 +2773,21 @@ private:
     }
 
     void rebuildOrder() {
+        bool hadSelection = false;
+        uint32_t selectedPeer = 0;
+        bool selectedBroadcast = false;
+        uint8_t selectedChannel = 0;
+        int previousSelection = menu.current();
+        if (previousSelection >= 0 && previousSelection < (int)convIndexMap.size()) {
+            Conversation* selected = getConversation(convIndexMap[previousSelection]);
+            if (selected) {
+                selectedPeer = selected->peer;
+                selectedBroadcast = selected->isBroadcast;
+                selectedChannel = selected->channel;
+                hadSelection = true;
+            }
+        }
+
         convIndexMap.clear();
         for (int i = 0; i < (int)gConversations.size(); ++i) {
             Conversation* conv = getConversation(i);
@@ -2791,7 +2813,20 @@ private:
             return ta < tb;
         });
 
-        if (menu.current() >= (int)convIndexMap.size()) {
+        bool selectionRestored = false;
+        if (hadSelection) {
+            for (size_t i = 0; i < convIndexMap.size(); ++i) {
+                const Conversation* conv = getConversation(convIndexMap[i]);
+                if (conv && conv->peer == selectedPeer &&
+                    conv->isBroadcast == selectedBroadcast && conv->channel == selectedChannel) {
+                    menu.selected = static_cast<int>(i);
+                    selectionRestored = true;
+                    break;
+                }
+            }
+        }
+        if ((!selectionRestored && hadSelection) ||
+            (!hadSelection && menu.current() >= (int)convIndexMap.size())) {
             menu.reset();
         }
     }
@@ -2855,7 +2890,7 @@ public:
         case NavKey::UP_FAST:
             currentStart -= step;
             if (currentStart < 0) currentStart = 0;
-            conv->firstVisibleIndex = currentStart;
+            conv->firstVisibleIndex = maxStart == 0 ? -1 : currentStart;
             break;
 
         case NavKey::DOWN:
@@ -2913,23 +2948,28 @@ public:
         default:
             break;
         }
+        clearUnreadIfVisible(conv);
     }
 
     void handleChars(const std::vector<char>& chars) override {
+        bool changed = false;
         for (char c : chars) {
             if (c == '\b') {
                 // Backspace removes the previous UTF-8 codepoint, not just its last byte.
                 if (inputBuffer.length() > 0) {
                     size_t start = previousUtf8Boundary(inputBuffer.c_str(), inputBuffer.length(), inputBuffer.length());
                     inputBuffer.remove(start);
+                    changed = true;
                 }
                 sendFeedback = "";
             } else if (c >= 32 && c <= 126) {
                 // Printable ASCII character
                 inputBuffer += c;
+                changed = true;
                 sendFeedback = "";
             }
         }
+        if (changed) clearUnreadIfVisible(getConversation(gActiveConversation));
     }
 
     void draw() override {
@@ -3055,6 +3095,13 @@ public:
     }
 
 private:
+    void clearUnreadIfVisible(Conversation* conv) {
+        if (!gScreenSleeping && conv && conv->firstVisibleIndex < 0 && conv->hasUnread) {
+            conv->hasUnread = false;
+            persistConversation(gActiveConversation);
+        }
+    }
+
     bool formatMessageTime(uint32_t epoch, String& timeText, String& dateText) const {
         const String& tz = gMesh.timeZone();
         if (epoch == 0 || tz.length() == 0) return false;
@@ -3433,9 +3480,18 @@ void ScreenManager::handleNav(NavKey k) {
 }
 
 void ScreenManager::redrawIfNeeded() {
-    if (needRedraw && currentScreen) {
+    if (needRedraw && currentScreen && !gScreenSleeping) {
         currentScreen->draw();
         needRedraw = false;
+        if (currentId == ScreenId::NODES || currentId == ScreenId::NODE_ACTIONS ||
+            currentId == ScreenId::NODE_INFO) {
+            gLastRenderedNodeRevision = gMesh.nodeRevision();
+            gLastNodeScreenRefreshMs = millis();
+        }
+        if (currentId == ScreenId::HOME) {
+            gLastRenderedBatteryStatus = batteryStatusLabel();
+            gLastBatteryCheckMs = millis();
+        }
     }
 }
 
@@ -3512,6 +3568,20 @@ void ScreenManager::loop() {
     if (gLastRenderedStorageError != gStorageError) needRedraw = true;
     gLastRenderedStorageError = gStorageError;
 
+    bool nodeDataScreen = currentId == ScreenId::NODES || currentId == ScreenId::NODE_ACTIONS ||
+                          currentId == ScreenId::NODE_INFO;
+    if (nodeDataScreen && !gScreenSleeping) {
+        bool nodeDataChanged = gMesh.nodeRevision() != gLastRenderedNodeRevision;
+        bool ageRefreshDue = now - gLastNodeScreenRefreshMs >= 5000;
+        bool coalesceElapsed = now - gLastNodeScreenRefreshMs >= kNodeUpdateCoalesceMs;
+        if (ageRefreshDue || (nodeDataChanged && coalesceElapsed)) needRedraw = true;
+    }
+    if (currentId == ScreenId::HOME && !gScreenSleeping &&
+        now - gLastBatteryCheckMs >= 5000) {
+        gLastBatteryCheckMs = now;
+        if (batteryStatusLabel() != gLastRenderedBatteryStatus) needRedraw = true;
+    }
+
     if (tryLoadConversationsOnce()) {
         needRedraw = true;
     }
@@ -3545,7 +3615,10 @@ void ScreenManager::loop() {
         uint32_t peer = isBroadcast ? kBroadcastAddr : (msg.fromMe ? msg.to : sender);
         int convIndex = ensureConversation(peer, isBroadcast, msg.channel);
         bool isActive = (convIndex == gActiveConversation);
-        bool markUnread = (!msg.fromMe && !isActive);
+        Conversation* targetConversation = getConversation(convIndex);
+        bool actuallyVisible = currentId == ScreenId::CHAT && isActive && !gScreenSleeping &&
+                               targetConversation && targetConversation->firstVisibleIndex < 0;
+        bool markUnread = shouldMarkMessageUnread(msg.fromMe, actuallyVisible);
         Serial.printf("[App] RX route: from=0x%08lX peer=0x%08lX broadcast=%d ch=%u conv=%d active=%d unread=%d\n",
                       (unsigned long)sender,
                       (unsigned long)peer,
