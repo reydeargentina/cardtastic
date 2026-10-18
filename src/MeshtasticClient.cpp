@@ -225,6 +225,7 @@ void MeshtasticClient::begin() {
     _autoConnectAttemptStartedMs = 0;
     _nextAutoConnectAttemptMs = 0;
     _myNodeNum      = 0;
+    _nodeRevision  = 0;
     _timeZone       = "";
     _radioTimeEpoch = 0;
     _radioTimeAnchorMs = 0;
@@ -624,6 +625,7 @@ MeshNodeInfo* MeshtasticClient::getOrCreateNode(uint32_t num) {
     MeshNodeInfo entry;
     entry.num = num;
     _nodes.push_back(entry);
+    ++_nodeRevision;
     return &_nodes.back();
 }
 
@@ -924,6 +926,7 @@ void MeshtasticClient::resetConnectionState(bool clearNodes) {
     _needsServiceDiscovery = false;
     _pendingConnectIndex = -1;
     if (clearNodes) {
+        if (!_nodes.empty()) ++_nodeRevision;
         _nodes.clear();
     }
 }
@@ -1658,6 +1661,7 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
             node->voltage = fr.node_info.device_metrics.voltage;
         }
 
+        ++_nodeRevision;
         return true;
     }
 
@@ -1701,6 +1705,7 @@ bool MeshtasticClient::decodeFromRadioAndQueue(const uint8_t* data, size_t len)
                 node->lastActivityObservedMs = millis();
                 node->activitySource = MeshActivitySource::LOCAL_OBSERVATION;
             }
+            ++_nodeRevision;
         }
     }
     if (pkt.which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
