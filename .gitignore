@@ -6,3 +6,5 @@
 lib/_upstream/
 platformio.local.ini
 scripts/make_merged.sh
+dist/
+__pycache__/

@@ -1,6 +1,6 @@
 # Cardtastic
 
-**Cardtastic v0.6** is a lightweight Meshtastic client for the **M5Stack Cardputer v1.1**. It connects to a Meshtastic radio over Bluetooth Low Energy (BLE) and puts conversations, channels, and nearby nodes at your fingertips—without changing the radio's configuration.
+**Cardtastic** is a lightweight Meshtastic client for the **M5Stack Cardputer v1.1**. It connects to a Meshtastic radio over Bluetooth Low Energy (BLE) and puts conversations, channels, and nearby nodes at your fingertips—without changing the radio's configuration. The firmware's version is maintained in [`include/version.h`](include/version.h).
 
 ## What you can do
 
@@ -62,6 +62,11 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic -Isrc test/native/client_state_te
 
 The firmware build does not require a connected device or the local
 `platformio.local.ini` override.
+
+## Firmware releases
+
+See [docs/RELEASING.md](docs/RELEASING.md) for the release procedure, firmware
+artifacts, flashing offsets, and checksum verification.
 
 ## First connection
 

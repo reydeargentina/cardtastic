@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ## Current
+- Added a reproducible release package with a merged firmware image and SHA-256 checksums.
 - Fixed sorted channel insertion and bounded configuration sync retries; serialized BLE event handling.
 - Isolated application state and conversation history by radio session, and improved SD persistence and recovery.
 - Enforced a 200-byte UTF-8 message limit without silent truncation and improved delivery-state tracking.

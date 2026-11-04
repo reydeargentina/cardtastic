@@ -13,6 +13,7 @@
 #include "MessageTextPolicy.h"
 #include "StoragePolicy.h"
 #include "UiPolicy.h"
+#include "version.h"
 #include "meshtastic/channel.pb.h"
 
 // -------------------- Basic navigation --------------------
@@ -1801,7 +1802,7 @@ public:
         // --- Header (small text) ---
         d.setTextSize(1);
         d.setTextColor(kColorHeaderText, kColorHeaderBg);
-        String title = "Cardtastic 0.6";
+        String title = String("Cardtastic ") + CARDTASTIC_VERSION;
         int titleX = (d.width() - d.textWidth(title)) / 2;
         if (titleX < 0) titleX = 0;
         d.setCursor(titleX, 4);
