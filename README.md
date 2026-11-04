@@ -47,6 +47,22 @@ upload_port = /dev/serial/by-id/your-cardputer
 monitor_port = /dev/serial/by-id/your-cardputer
 ```
 
+## Automated checks
+
+GitHub Actions builds the firmware and runs the native regression tests on pull
+requests to `main` and pushes to `main`. To run the same checks locally, install
+PlatformIO Core 6.1.18 and a C++ compiler, then run:
+
+```sh
+python3 -m pip install platformio==6.1.18
+pio run -e m5stack-cardputer
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic -Isrc test/native/client_state_test.cpp -o /tmp/cardtastic-client-state-test
+/tmp/cardtastic-client-state-test
+```
+
+The firmware build does not require a connected device or the local
+`platformio.local.ini` override.
+
 ## First connection
 
 1. Make sure Bluetooth is enabled on your already-configured Meshtastic radio.
