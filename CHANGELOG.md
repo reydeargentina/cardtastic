@@ -2,6 +2,8 @@
 
 All notable changes to this project will be documented in this file.
 
+## Current
+
 ## v0.6 - 2026-10-15
 - Improved message delivery reliability and show delivery status in chat.
 - Refresh conversations as messages arrive and retain node identities for sender labels.
