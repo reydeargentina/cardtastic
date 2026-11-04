@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file.
 
 ## Current
+- Fixed sorted channel insertion and bounded configuration sync retries; serialized BLE event handling.
+- Isolated application state and conversation history by radio session, and improved SD persistence and recovery.
+- Enforced a 200-byte UTF-8 message limit without silent truncation and improved delivery-state tracking.
+- Preserved message IDs and timestamps and deduplicated received packets.
+- Used radio timestamps for node activity and kept the UI responsive during BLE scans and synchronization.
+- Refreshed live UI state and tracked unread messages based on chat visibility.
 
 ## v0.6 - 2026-10-15
 - Improved message delivery reliability and show delivery status in chat.
